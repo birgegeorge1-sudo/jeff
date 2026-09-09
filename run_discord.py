@@ -1,4 +1,3 @@
-```python
 import os
 import threading
 
@@ -76,4 +75,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
