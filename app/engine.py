@@ -1,6 +1,6 @@
 import json
 import os
-from mistralai import Mistral
+from mistralai.client import Mistral
 
 MODEL = os.getenv("MODEL", "mistral-large-latest")
 PERSONA_PATH = os.getenv("PERSONA_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "persona.json"))
