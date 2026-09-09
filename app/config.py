@@ -33,7 +33,7 @@ MYSQL_URL = _env("MYSQL_URL")
 
 HOST = _env(
     "HOST",
-    "127.0.0.1",
+    "0.0.0.0",
 )
 
 PORT = int(
@@ -41,9 +41,9 @@ PORT = int(
 )
 
 MAX_HISTORY = int(
-    _env("MAX_HISTORY", "40")
+    _env("MAX_HISTORY", "100")
 )
 
 MIN_QUESTION_INTERVAL = int(
-    _env("MIN_QUESTION_INTERVAL", "3")
+    _env("MIN_QUESTION_INTERVAL", "5")
 )
