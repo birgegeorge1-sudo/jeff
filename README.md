@@ -1,4 +1,4 @@
-# Romance Copilot — Discord + Mistral + MySQL
+# Discord + Mistral + MySQL
 
 This handoff adds Discord as the operator UI and upgrades the conversation engine.
 
