@@ -22,6 +22,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -50,10 +51,12 @@ def _prepare_mysql_url(raw_url: Optional[str]) -> str:
     Normalize and validate MYSQL_URL.
 
     Supports:
-        mysql://...
-        mysql+mysqlconnector://...
+
+        mysql://user:password@host:port/database
+        mysql+mysqlconnector://user:password@host:port/database
 
     Also handles accidental values such as:
+
         MYSQL_URL=mysql://...
         MYSQL_URL=MYSQL_URL=mysql://...
     """
@@ -128,6 +131,7 @@ def _prepare_mysql_url(raw_url: Optional[str]) -> str:
             "The password is intentionally not shown."
         ) from exc
 
+    # Validate backend.
     if parsed.get_backend_name() != "mysql":
         raise RuntimeError(
             "MYSQL_URL uses backend "
@@ -135,6 +139,7 @@ def _prepare_mysql_url(raw_url: Optional[str]) -> str:
             "expected 'mysql'."
         )
 
+    # Validate driver.
     if parsed.get_driver_name() != "mysqlconnector":
         raise RuntimeError(
             "MYSQL_URL uses driver "
@@ -142,6 +147,7 @@ def _prepare_mysql_url(raw_url: Optional[str]) -> str:
             "expected 'mysqlconnector'."
         )
 
+    # Validate required connection fields.
     if not parsed.username:
         raise RuntimeError(
             "MYSQL_URL is missing the username."
@@ -183,7 +189,11 @@ def _build_engine():
     Build the SQLAlchemy MySQL engine.
 
     Handles Aiven-style:
+
         ?ssl-mode=REQUIRED
+
+    by removing ssl-mode from the URL and passing the appropriate
+    SSL settings through mysql-connector connect_args.
     """
 
     global DATABASE_URL
@@ -274,6 +284,19 @@ class Base(DeclarativeBase):
 class Contact(Base):
     """
     Stored Discord contact/conversation identity.
+
+    `name` is the actual database column.
+
+    `display_name` and `canonical_name` are compatibility
+    properties used by the Discord bot.
+
+    `canonical_name` is a SQLAlchemy hybrid property, so code such as:
+
+        select(Contact).where(
+            Contact.canonical_name == "Esther"
+        )
+
+    works correctly.
     """
 
     __tablename__ = "contacts"
@@ -346,13 +369,14 @@ class Contact(Base):
         onupdate=utc_now,
     )
 
-    @property
+    # --------------------------------------------------------
+    # DISPLAY NAME
+    # --------------------------------------------------------
+
+    @hybrid_property
     def display_name(self) -> str:
         """
-        Human-readable compatibility property.
-
-        Existing Discord bot code can safely use:
-            contact.display_name
+        Human-readable contact name.
         """
 
         if self.name:
@@ -366,10 +390,72 @@ class Contact(Base):
 
         return f"Contact #{self.id}"
 
+    @display_name.expression
+    def display_name(cls):
+        """
+        SQL expression for display_name.
+        """
+
+        return func.coalesce(
+            cls.name,
+            cls.discord_username,
+            cls.discord_user_id,
+            func.concat(
+                "Contact #",
+                cls.id,
+            ),
+        )
+
+    # --------------------------------------------------------
+    # CANONICAL NAME
+    # --------------------------------------------------------
+
+    @hybrid_property
+    def canonical_name(self) -> str:
+        """
+        Canonical human-readable name.
+
+        Instance usage:
+
+            contact.canonical_name
+
+        and class-level SQL usage:
+
+            Contact.canonical_name == "Esther"
+        """
+
+        if self.name:
+            return self.name
+
+        if self.discord_username:
+            return self.discord_username
+
+        if self.discord_user_id:
+            return self.discord_user_id
+
+        return f"Contact #{self.id}"
+
+    @canonical_name.expression
+    def canonical_name(cls):
+        """
+        SQL expression for canonical_name.
+        """
+
+        return func.coalesce(
+            cls.name,
+            cls.discord_username,
+            cls.discord_user_id,
+            func.concat(
+                "Contact #",
+                cls.id,
+            ),
+        )
+
     def __repr__(self) -> str:
         return (
             f"<Contact "
             f"id={self.id!r} "
+            f"canonical_name={self.canonical_name!r} "
             f"display_name={self.display_name!r} "
             f"discord_user_id={self.discord_user_id!r} "
             f"is_active={self.is_active!r}>"
@@ -382,7 +468,9 @@ class Contact(Base):
 
 def init_db() -> None:
     """
-    Create missing tables without deleting existing data.
+    Create all missing tables.
+
+    Existing data and existing tables are not deleted.
     """
 
     try:
@@ -398,7 +486,9 @@ def init_db() -> None:
 
 
 def initialize_database() -> None:
-    """Compatibility alias."""
+    """
+    Compatibility alias for init_db().
+    """
     init_db()
 
 
@@ -409,7 +499,9 @@ def initialize_database() -> None:
 def _normalize_optional_string(
     value: Optional[Any],
 ) -> Optional[str]:
-    """Convert a value to a trimmed string or None."""
+    """
+    Convert a value to a trimmed string or None.
+    """
 
     if value is None:
         return None
@@ -433,14 +525,23 @@ def find_contact(
     name: Optional[Any] = None,
 ) -> Optional[Contact]:
     """
-    Find a contact using an explicit field or a generic identifier.
+    Find a contact.
 
-    A generic string such as "Esther" is treated as a contact
-    name/username/email candidate rather than automatically being
-    treated as a Discord ID.
+    Explicit fields are preferred.
+
+    A generic value such as "Esther" is searched against:
+        - name
+        - discord username
+        - discord user ID
+        - email
+
+    Numeric values can additionally match the database ID.
     """
 
-    # Explicit Discord user ID.
+    # --------------------------------------------------------
+    # Discord user ID
+    # --------------------------------------------------------
+
     if discord_user_id is not None:
         value = _normalize_optional_string(
             discord_user_id
@@ -459,7 +560,10 @@ def find_contact(
             .first()
         )
 
-    # Explicit Discord username.
+    # --------------------------------------------------------
+    # Discord username
+    # --------------------------------------------------------
+
     if discord_username is not None:
         value = _normalize_optional_string(
             discord_username
@@ -478,7 +582,10 @@ def find_contact(
             .first()
         )
 
-    # Explicit email.
+    # --------------------------------------------------------
+    # Email
+    # --------------------------------------------------------
+
     if email is not None:
         value = _normalize_optional_string(email)
 
@@ -495,7 +602,10 @@ def find_contact(
             .first()
         )
 
-    # Explicit name.
+    # --------------------------------------------------------
+    # Human-readable name
+    # --------------------------------------------------------
+
     if name is not None:
         value = _normalize_optional_string(name)
 
@@ -514,7 +624,10 @@ def find_contact(
             .first()
         )
 
-    # Generic lookup.
+    # --------------------------------------------------------
+    # Generic lookup
+    # --------------------------------------------------------
+
     value = _normalize_optional_string(identifier)
 
     if not value:
@@ -527,7 +640,7 @@ def find_contact(
         Contact.email == value,
     ]
 
-    # Numeric generic identifiers can also be database IDs.
+    # Numeric identifiers can also refer to database primary key.
     try:
         numeric_id = int(value)
     except (TypeError, ValueError):
@@ -570,7 +683,7 @@ def get_or_create_contact(
     **extra_fields: Any,
 ) -> Contact:
     """
-    Find an existing contact or create a new one.
+    Find an existing contact or create a new contact.
     """
 
     normalized_identifier = (
@@ -607,35 +720,34 @@ def get_or_create_contact(
 
     contact: Optional[Contact] = None
 
-    # Strongest identifier first.
+    # --------------------------------------------------------
+    # Search in strongest order.
+    # --------------------------------------------------------
+
     if normalized_discord_id:
         contact = find_contact(
             db,
             discord_user_id=normalized_discord_id,
         )
 
-    # Then email.
     if contact is None and normalized_email:
         contact = find_contact(
             db,
             email=normalized_email,
         )
 
-    # Then username.
     if contact is None and normalized_username:
         contact = find_contact(
             db,
             discord_username=normalized_username,
         )
 
-    # Then human-readable name.
     if contact is None and normalized_name:
         contact = find_contact(
             db,
             name=normalized_name,
         )
 
-    # Then generic identifier.
     if contact is None and normalized_identifier:
         contact = find_contact(
             db,
@@ -643,7 +755,7 @@ def get_or_create_contact(
         )
 
     # ========================================================
-    # UPDATE EXISTING
+    # EXISTING CONTACT
     # ========================================================
 
     if contact is not None:
@@ -724,7 +836,7 @@ def get_or_create_contact(
         return contact
 
     # ========================================================
-    # CREATE NEW
+    # CREATE CONTACT
     # ========================================================
 
     contact = Contact(
@@ -766,11 +878,15 @@ def get_or_create_contact(
 def get_active_contact(
     db,
 ) -> Optional[Contact]:
-    """Return the active contact, if one exists."""
+    """
+    Return the currently active contact.
+    """
 
     stmt = (
         select(Contact)
-        .where(Contact.is_active.is_(True))
+        .where(
+            Contact.is_active.is_(True)
+        )
         .order_by(
             Contact.updated_at.desc(),
             Contact.id.desc(),
@@ -792,7 +908,14 @@ def set_active_contact(
     commit: bool = True,
 ) -> Optional[Contact]:
     """
-    Set exactly one contact as active.
+    Mark exactly one contact as active.
+
+    Accepts:
+        Contact instance
+        database ID
+        Discord ID
+        Discord username
+        human-readable contact name
     """
 
     if isinstance(contact, Contact):
@@ -839,7 +962,16 @@ def delete_contact(
     *,
     commit: bool = True,
 ) -> bool:
-    """Delete a contact."""
+    """
+    Delete a contact.
+
+    Accepts:
+        Contact instance
+        ID
+        Discord ID
+        username
+        name
+    """
 
     if isinstance(contact, Contact):
         selected = contact
@@ -871,7 +1003,9 @@ def list_contacts(
     active_only: bool = False,
     limit: Optional[int] = None,
 ) -> list[Contact]:
-    """Return contacts newest-first."""
+    """
+    Return contacts ordered newest-first.
+    """
 
     stmt = (
         select(Contact)
@@ -910,7 +1044,8 @@ def count_contacts(db) -> int:
     )
 
     return int(
-        db.execute(stmt).scalar_one()
+        db.execute(stmt)
+        .scalar_one()
     )
 
 
@@ -919,7 +1054,9 @@ def count_contacts(db) -> int:
 # ============================================================
 
 def get_db():
-    """Yield a database session."""
+    """
+    Yield a SQLAlchemy database session.
+    """
 
     db = SessionLocal()
 
@@ -944,7 +1081,7 @@ def close_session(db) -> None:
 
 
 def commit_session(db) -> None:
-    """Commit safely."""
+    """Commit the current transaction."""
 
     try:
         db.commit()
@@ -955,24 +1092,29 @@ def commit_session(db) -> None:
 
 
 def rollback_session(db) -> None:
-    """Rollback safely."""
+    """Rollback the current transaction."""
 
     try:
         db.rollback()
+
     except Exception:
         pass
 
 
 # ============================================================
-# DATABASE HEALTH
+# DATABASE HEALTH CHECK
 # ============================================================
 
 def check_database_connection() -> bool:
-    """Check that MySQL is reachable."""
+    """
+    Return True if the MySQL server is reachable.
+    """
 
     try:
         with engine.connect() as connection:
-            connection.execute(text("SELECT 1"))
+            connection.execute(
+                text("SELECT 1")
+            )
 
         return True
 
@@ -981,33 +1123,44 @@ def check_database_connection() -> bool:
 
 
 # ============================================================
-# STARTUP DATABASE INITIALIZATION
+# AUTOMATIC STARTUP INITIALIZATION
 # ============================================================
 
 def _startup_database_init() -> None:
     """
-    Guarantee that the contacts table exists before the bot
-    handles commands.
+    Ensure required tables exist before the bot can receive
+    commands.
     """
     init_db()
 
 
+# Initialize schema immediately when app.db is imported.
 _startup_database_init()
 
 
 # ============================================================
-# COMMAND-LINE TEST
+# COMMAND-LINE SUPPORT
 # ============================================================
 
 if __name__ == "__main__":
-    print("[database] Initializing database...")
+    print(
+        "[database] Initializing database..."
+    )
+
     init_db()
-    print("[database] Database initialization complete.")
+
+    print(
+        "[database] Database initialization complete."
+    )
 
     if check_database_connection():
-        print("[database] Connection check: OK")
+        print(
+            "[database] Connection check: OK"
+        )
     else:
-        print("[database] Connection check: FAILED")
+        print(
+            "[database] Connection check: FAILED"
+        )
 
 
 # ============================================================
