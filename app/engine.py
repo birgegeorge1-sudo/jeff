@@ -42,45 +42,41 @@ with open(
 # ============================================================
 # Mistral API key pool
 #
-# Supported environment variables:
+# ONLY configuration required:
 #
-#   MISTRAL_API_KEY
-#   MISTRAL_API_KEY_1
-#   MISTRAL_API_KEY_2
-#   MISTRAL_API_KEY_3
-#   ...
+#   MISTRAL_API_KEYS=key1,key2,key3,key4
 #
-# The primary MISTRAL_API_KEY is used first.
-# Additional numbered keys are rotated automatically when
-# a key is rate-limited.
+# Keys are comma-separated.
+#
+# Example:
+#
+#   MISTRAL_API_KEYS=abc123,def456,ghi789
+#
+# Whitespace surrounding keys is ignored.
+# Duplicate keys are removed.
 # ============================================================
 
 def _load_mistral_keys() -> list[str]:
-    keys: list[str] = []
-
-    primary = os.getenv(
-        "MISTRAL_API_KEY",
+    raw_keys = os.getenv(
+        "MISTRAL_API_KEYS",
         "",
     ).strip()
 
-    if primary:
-        keys.append(primary)
+    if not raw_keys:
+        return []
 
-    index = 1
+    keys: list[str] = []
 
-    while True:
-        key = os.getenv(
-            f"MISTRAL_API_KEY_{index}",
-            "",
-        ).strip()
+    for raw_key in raw_keys.split(","):
+        key = raw_key.strip()
 
         if not key:
-            break
+            continue
 
-        if key not in keys:
-            keys.append(key)
+        if key in keys:
+            continue
 
-        index += 1
+        keys.append(key)
 
     return keys
 
@@ -90,8 +86,8 @@ MISTRAL_API_KEYS = _load_mistral_keys()
 if not MISTRAL_API_KEYS:
     raise RuntimeError(
         "No Mistral API keys configured. "
-        "Set MISTRAL_API_KEY and optionally "
-        "MISTRAL_API_KEY_1, MISTRAL_API_KEY_2, etc."
+        "Set the MISTRAL_API_KEYS environment variable "
+        "to a comma-separated list of API keys."
     )
 
 
@@ -101,10 +97,17 @@ MISTRAL_CLIENTS = [
 ]
 
 
-# Shared rotation position.
-#
-# This is intentionally module-level so requests naturally
-# move through the configured key pool.
+print(
+    "[Mistral] Loaded "
+    f"{len(MISTRAL_CLIENTS)} API key(s) "
+    "from MISTRAL_API_KEYS."
+)
+
+
+# ============================================================
+# Shared rotation position
+# ============================================================
+
 _current_key_index = 0
 
 
@@ -119,6 +122,7 @@ def _rotate_key() -> None:
     Move to the next configured Mistral API key.
 
     With one key this is a no-op.
+    With multiple keys the position wraps around.
     """
     global _current_key_index
 
@@ -130,11 +134,18 @@ def _rotate_key() -> None:
     ) % len(MISTRAL_CLIENTS)
 
 
-def _extract_status_code(exc: Exception) -> Optional[int]:
+# ============================================================
+# HTTP / SDK error helpers
+# ============================================================
+
+def _extract_status_code(
+    exc: Exception,
+) -> Optional[int]:
     """
     Try several locations used by different versions of the
     Mistral SDK / HTTP stack to expose the HTTP status code.
     """
+
     status_code = getattr(
         exc,
         "status_code",
@@ -144,7 +155,10 @@ def _extract_status_code(exc: Exception) -> Optional[int]:
     if status_code is not None:
         try:
             return int(status_code)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             pass
 
     http_response = getattr(
@@ -163,7 +177,10 @@ def _extract_status_code(exc: Exception) -> Optional[int]:
         if status_code is not None:
             try:
                 return int(status_code)
-            except (TypeError, ValueError):
+            except (
+                TypeError,
+                ValueError,
+            ):
                 pass
 
     response = getattr(
@@ -182,18 +199,26 @@ def _extract_status_code(exc: Exception) -> Optional[int]:
         if status_code is not None:
             try:
                 return int(status_code)
-            except (TypeError, ValueError):
+            except (
+                TypeError,
+                ValueError,
+            ):
                 pass
 
     return None
 
 
-def _is_rate_limited(exc: Exception) -> bool:
+def _is_rate_limited(
+    exc: Exception,
+) -> bool:
     """
     Detect Mistral HTTP 429 / rate-limited responses without
-    relying on one exact SDK exception class.
+    depending on one exact SDK exception class.
     """
-    status_code = _extract_status_code(exc)
+
+    status_code = _extract_status_code(
+        exc
+    )
 
     if status_code == 429:
         return True
@@ -217,21 +242,24 @@ def _is_rate_limited(exc: Exception) -> bool:
     )
 
 
-def _retry_delay(attempt: int) -> float:
+def _retry_delay(
+    attempt: int,
+) -> float:
     """
     Exponential backoff with jitter.
 
-    Example approximate delays:
+    Approximate base delays:
         attempt 0 -> 1 sec
         attempt 1 -> 2 sec
         attempt 2 -> 4 sec
         attempt 3 -> 8 sec
         attempt 4 -> 16 sec
-        capped at 30 sec
+        ...
+    capped at 30 seconds.
 
-    Jitter prevents several simultaneous requests from
-    retrying at exactly the same moment.
+    Jitter avoids synchronized retry bursts.
     """
+
     base = min(
         30.0,
         2.0 ** attempt,
@@ -245,29 +273,42 @@ def _retry_delay(attempt: int) -> float:
     return base + jitter
 
 
+# ============================================================
+# Centralized Mistral completion handler
+# ============================================================
+
 def _mistral_complete(
     *,
     messages: list[dict[str, Any]],
     temperature: float = 0.55,
-    response_format: Optional[dict[str, Any]] = None,
+    response_format: Optional[
+        dict[str, Any]
+    ] = None,
     max_tokens: Optional[int] = None,
 ):
     """
     Centralized Mistral request handler.
 
     Features:
-      - multiple API-key rotation
-      - automatic 429 detection
+
+      - multiple API-key support
+      - comma-separated MISTRAL_API_KEYS
+      - automatic key rotation
+      - HTTP 429 detection
       - exponential backoff
       - jitter
       - bounded retries
-      - preservation of non-429 exceptions
+      - non-429 errors are preserved
 
-    A 429 rotates to another key before retrying.
+    Every rate-limited attempt advances to the next key.
+
+    The same request is retried until:
+      - a request succeeds, or
+      - all retry attempts are exhausted.
     """
 
-    # Two passes through the pool at most, while guaranteeing
-    # a minimum of three attempts.
+    # Two passes through the configured pool at most,
+    # while guaranteeing at least three attempts.
     max_attempts = max(
         3,
         len(MISTRAL_CLIENTS) * 2,
@@ -275,9 +316,18 @@ def _mistral_complete(
 
     last_exception: Optional[Exception] = None
 
-    for attempt in range(max_attempts):
+    for attempt in range(
+        max_attempts
+    ):
         client = _current_client()
-        key_number = _current_key_index + 1
+
+        key_number = (
+            _current_key_index + 1
+        )
+
+        total_keys = len(
+            MISTRAL_CLIENTS
+        )
 
         kwargs: dict[str, Any] = {
             "model": MODEL,
@@ -286,7 +336,9 @@ def _mistral_complete(
         }
 
         if response_format is not None:
-            kwargs["response_format"] = response_format
+            kwargs["response_format"] = (
+                response_format
+            )
 
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
@@ -299,35 +351,53 @@ def _mistral_complete(
         except Exception as exc:
             last_exception = exc
 
-            if not _is_rate_limited(exc):
-                # Do not retry unrelated API errors indefinitely.
+            # ------------------------------------------------
+            # Non-429 exception
+            # ------------------------------------------------
+
+            if not _is_rate_limited(
+                exc
+            ):
                 raise
+
+            # ------------------------------------------------
+            # 429
+            # ------------------------------------------------
 
             print(
                 "[Mistral] Rate limited "
                 f"on key {key_number}/"
-                f"{len(MISTRAL_CLIENTS)} "
+                f"{total_keys} "
                 f"(attempt {attempt + 1}/"
                 f"{max_attempts})."
             )
 
-            # Move to another key immediately when available.
+            # Rotate immediately.
             _rotate_key()
 
-            # If another attempt remains, back off before retrying.
+            # ------------------------------------------------
+            # Retry if attempts remain
+            # ------------------------------------------------
+
             if attempt < max_attempts - 1:
                 delay = _retry_delay(
                     attempt
                 )
 
-                print(
-                    f"[Mistral] Retrying in "
-                    f"{delay:.2f}s with key "
-                    f"{_current_key_index + 1}/"
-                    f"{len(MISTRAL_CLIENTS)}."
+                next_key_number = (
+                    _current_key_index + 1
                 )
 
-                time.sleep(delay)
+                print(
+                    "[Mistral] Retrying in "
+                    f"{delay:.2f}s with key "
+                    f"{next_key_number}/"
+                    f"{total_keys}."
+                )
+
+                time.sleep(
+                    delay
+                )
 
     raise RuntimeError(
         "Mistral API remained rate-limited after "
@@ -401,6 +471,7 @@ Core operating principles:
    Do not force escalation.
 
    When intimacy becomes relevant, assess:
+
    mutuality,
    comfort,
    privacy,
@@ -465,16 +536,25 @@ Do not include markdown fences.
 # Utility functions
 # ============================================================
 
-def _clean_content(content: Any) -> str:
+def _clean_content(
+    content: Any,
+) -> str:
     """
     Normalize different Mistral response-content shapes into
     plain text suitable for json.loads().
     """
-    if isinstance(content, list):
+
+    if isinstance(
+        content,
+        list,
+    ):
         parts = []
 
         for part in content:
-            if isinstance(part, dict):
+            if isinstance(
+                part,
+                dict,
+            ):
                 parts.append(
                     str(
                         part.get(
@@ -503,8 +583,11 @@ def _clamp_score(
     """
     Safely normalize model score values to 0-100.
     """
+
     try:
-        value = int(float(value))
+        value = int(
+            float(value)
+        )
     except (
         TypeError,
         ValueError,
@@ -532,11 +615,23 @@ def deterministic_signals(
     words = text.split()
 
     if not words:
-        return 100, 0, "flat"
+        return (
+            100,
+            0,
+            "flat",
+        )
 
-    very_short = len(words) <= 3
-    question_marks = incoming.count("?")
-    recent_len = len(recent)
+    very_short = (
+        len(words) <= 3
+    )
+
+    question_marks = (
+        incoming.count("?")
+    )
+
+    recent_len = len(
+        recent
+    )
 
     boredom = 0
 
@@ -676,16 +771,21 @@ def generate_reply(
     """
     Generate the relationship-coaching response.
 
-    Mistral requests go through _mistral_complete(), which provides:
+    Mistral requests go through _mistral_complete(), which
+    provides:
+
       - multiple API keys
-      - automatic rotation
+      - automatic key rotation
       - 429 handling
-      - retry/backoff
+      - exponential retry/backoff
+      - jitter
     """
 
-    boredom, reciprocity, fallback_vibe = deterministic_signals(
-        incoming,
-        messages,
+    boredom, reciprocity, fallback_vibe = (
+        deterministic_signals(
+            incoming,
+            messages,
+        )
     )
 
     context = build_context(
@@ -712,14 +812,18 @@ def generate_reply(
         temperature=0.55,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Extract response safely
-    # --------------------------------------------------------
+    # ========================================================
 
     try:
-        raw_content = response.choices[
-            0
-        ].message.content
+        raw_content = (
+            response
+            .choices[0]
+            .message
+            .content
+        )
+
     except (
         AttributeError,
         IndexError,
@@ -742,9 +846,8 @@ def generate_reply(
         data = json.loads(
             cleaned
         )
+
     except json.JSONDecodeError as exc:
-        # Keep a useful diagnostic while avoiding an enormous
-        # response dump in logs.
         preview = cleaned[:1000]
 
         raise RuntimeError(
@@ -752,14 +855,17 @@ def generate_reply(
             f"Response preview: {preview}"
         ) from exc
 
-    if not isinstance(data, dict):
+    if not isinstance(
+        data,
+        dict,
+    ):
         raise RuntimeError(
             "Mistral returned JSON that was not an object."
         )
 
-    # --------------------------------------------------------
-    # Normalize required fields
-    # --------------------------------------------------------
+    # ========================================================
+    # Normalize required reply field
+    # ========================================================
 
     reply_text = data.get(
         "reply",
@@ -774,7 +880,13 @@ def generate_reply(
             reply_text
         )
 
-    data["reply"] = reply_text.strip()
+    data["reply"] = (
+        reply_text.strip()
+    )
+
+    # ========================================================
+    # Normalize alternatives
+    # ========================================================
 
     alternatives = data.get(
         "alternatives",
@@ -792,6 +904,10 @@ def generate_reply(
         for item in alternatives[:3]
         if str(item).strip()
     ]
+
+    # ========================================================
+    # Normalize memory updates
+    # ========================================================
 
     memory_updates = data.get(
         "memory_updates",
@@ -855,11 +971,13 @@ def generate_reply(
             }
         )
 
-    data["memory_updates"] = normalized_memory_updates
+    data["memory_updates"] = (
+        normalized_memory_updates
+    )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Score normalization
-    # --------------------------------------------------------
+    # ========================================================
 
     model_boredom = _clamp_score(
         data.get(
@@ -882,34 +1000,41 @@ def generate_reply(
         boredom,
     )
 
-    # Use the model's reciprocity judgment when valid,
-    # but keep deterministic scoring as a conservative floor
-    # only when the model returned essentially no signal.
     if model_reciprocity <= 0:
-        data["reciprocity_score"] = reciprocity
+        data["reciprocity_score"] = (
+            reciprocity
+        )
     else:
-        data["reciprocity_score"] = model_reciprocity
+        data["reciprocity_score"] = (
+            model_reciprocity
+        )
 
     data["vibe"] = (
         data.get("vibe")
         or fallback_vibe
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Deterministic safety adjustments
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         data["boredom_score"] >= 65
-        and data.get("conversation_mode")
+        and data.get(
+            "conversation_mode"
+        )
         not in {
             "space",
             "lighten",
         }
     ):
-        data["conversation_mode"] = "lighten"
+        data["conversation_mode"] = (
+            "lighten"
+        )
 
-        if not data.get("next_goal"):
+        if not data.get(
+            "next_goal"
+        ):
             data["next_goal"] = (
                 "Change the rhythm with a lighter, "
                 "more specific topic."
@@ -923,25 +1048,31 @@ def generate_reply(
         default=0,
     )
 
-    data["date_readiness"] = date_readiness
+    data["date_readiness"] = (
+        date_readiness
+    )
 
     if (
         date_readiness >= 70
-        and data.get("relationship_stage")
+        and data.get(
+            "relationship_stage"
+        )
         not in {
             "date_ready",
             "cooling_off",
         }
     ):
-        if not data.get("next_goal"):
+        if not data.get(
+            "next_goal"
+        ):
             data["next_goal"] = (
                 "Make one relaxed, concrete invitation "
                 "when the conversation naturally opens the door."
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Ensure array fields remain arrays
-    # --------------------------------------------------------
+    # ========================================================
 
     for field in (
         "positive_signals",
@@ -956,7 +1087,9 @@ def generate_reply(
             value,
             list,
         ):
-            value = [str(value)]
+            value = [
+                str(value)
+            ]
 
         data[field] = [
             str(item).strip()
@@ -964,9 +1097,9 @@ def generate_reply(
             if str(item).strip()
         ]
 
-    # --------------------------------------------------------
+    # ========================================================
     # Ensure scalar fields exist
-    # --------------------------------------------------------
+    # ========================================================
 
     defaults = {
         "send_mode": "text",
