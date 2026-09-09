@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from typing import Any, Optional
 
 import discord
 from discord.ext import commands
@@ -21,9 +22,10 @@ from .db import (
 from .engine import generate_reply
 
 
-DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 PREFIX = os.getenv("DISCORD_PREFIX", "!")
-OWNER_DISCORD_USER_ID = os.getenv("OWNER_DISCORD_USER_ID", "")
+OWNER_DISCORD_USER_ID = os.getenv("OWNER_DISCORD_USER_ID", "").strip()
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -33,6 +35,9 @@ bot = commands.Bot(
     intents=intents,
 )
 
+
+# These are real Discord commands and MUST NEVER be interpreted
+# as dynamic contact names by the !Name: message parser.
 KNOWN_COMMANDS = {
     "newconvo",
     "deleteconvo",
@@ -43,23 +48,76 @@ KNOWN_COMMANDS = {
 
 
 def owner_only():
-    async def predicate(ctx):
+    async def predicate(ctx: commands.Context) -> bool:
         if not OWNER_DISCORD_USER_ID:
             return True
+
         return str(ctx.author.id) == OWNER_DISCORD_USER_ID
 
     return commands.check(predicate)
 
 
+def _is_registered_command(content: str) -> bool:
+    """
+    Detect a normal Discord command before attempting to parse
+    dynamic contact-addressed syntax.
+
+    Examples:
+
+        !newconvo Esther: ["Hi", "Hey"]
+        !deleteconvo Esther
+        !active
+        !helpme
+        !reply hello
+
+    This is the critical fix for the previous bug where:
+
+        !newconvo Esther: [...]
+
+    was interpreted as contact name "newconvo Esther".
+    """
+    if not content:
+        return False
+
+    prefix = PREFIX or "!"
+
+    if not content.startswith(prefix):
+        return False
+
+    remainder = content[len(prefix):].lstrip()
+
+    if not remainder:
+        return False
+
+    # Take the first whitespace-delimited token.
+    # Also strip ':' so forms such as !newconvo: ... are recognized.
+    command_token = remainder.split(None, 1)[0]
+    command_token = command_token.split(":", 1)[0].casefold()
+
+    return command_token in KNOWN_COMMANDS
+
+
 def _parse_contact_message(content: str):
     """
-    Parse either:
+    Parse dynamic contact-addressed messages.
+
+    Supported:
 
         !Esther: hello
-        !contEsther: hello
+        !Sarah: what are you doing?
+        !contEsther: hey
 
-    The contact name is dynamic and is resolved against the database.
+    The contact name is looked up dynamically in the database.
+
+    Returns:
+
+        (name, message, explicit_cont_prefix)
+
+    or None when the content is not contact-addressed.
     """
+    if not content:
+        return None
+
     match = re.match(
         r"^!(?P<prefix>cont)?(?P<name>[^:\n]{1,255}):\s*(?P<message>.+)$",
         content,
@@ -80,15 +138,56 @@ def _parse_contact_message(content: str):
     if not name or not message:
         return None
 
+    # Never allow a registered command to fall through to the
+    # dynamic-contact parser.
     if name.casefold() in KNOWN_COMMANDS:
         return None
 
     return name, message, bool(prefix)
 
 
+def _normalize_history_sender(
+    sender: Any,
+    default_sender: str,
+) -> str:
+    """
+    Normalize the sender value supplied in seeded history.
+    """
+    normalized = str(
+        sender if sender is not None else default_sender
+    ).strip().lower()
+
+    if normalized in {
+        "her",
+        "them",
+        "their",
+        "contact",
+        "incoming",
+        "received",
+        "other",
+    }:
+        return "incoming"
+
+    if normalized in {
+        "me",
+        "i",
+        "myself",
+        "owner",
+        "jeff",
+        "outgoing",
+        "sent",
+    }:
+        return "me"
+
+    raise ValueError(
+        "Each history object must use sender/role "
+        "'me' or 'incoming'."
+    )
+
+
 def _parse_newconvo_payload(payload: str):
     """
-    Parse:
+    Parse either:
 
         !newconvo Esther
 
@@ -96,21 +195,47 @@ def _parse_newconvo_payload(payload: str):
 
         !newconvo Esther: ["Hey", "Hey!", "How are you?"]
 
+    Also supports explicit sender objects:
+
+        !newconvo Esther: [
+            {"sender": "me", "content": "Hey"},
+            {"sender": "incoming", "content": "Hey!"}
+        ]
+
+    Positional string arrays alternate automatically:
+
+        item 1 -> me
+        item 2 -> incoming
+        item 3 -> me
+        item 4 -> incoming
+
     Returns:
 
         (name, normalized_history)
 
-    where normalized_history contains tuples of:
+    where normalized_history is:
 
-        ("me", "...")
-        ("incoming", "...")
+        [
+            ("me", "..."),
+            ("incoming", "..."),
+        ]
+
+    When no history is supplied, normalized_history is None.
     """
+    payload = (payload or "").strip()
+
+    if not payload:
+        return "", None
+
     if ":" not in payload:
-        return " ".join(payload.strip().split()), None
+        return " ".join(payload.split()), None
 
     name, raw_history = payload.split(":", 1)
 
-    name = " ".join(name.strip().split())
+    name = " ".join(
+        name.strip().split()
+    )
+
     raw_history = raw_history.strip()
 
     if not raw_history:
@@ -120,10 +245,16 @@ def _parse_newconvo_payload(payload: str):
         parsed = json.loads(raw_history)
     except json.JSONDecodeError as exc:
         raise ValueError(
-            'History after the colon must be valid JSON, e.g. ["Hi", "Hey!"]'
+            'History after the colon must be valid JSON, '
+            'for example: ["Hi", "Hey!"]'
         ) from exc
 
-    if not isinstance(parsed, list) or not parsed:
+    if not isinstance(parsed, list):
+        raise ValueError(
+            "Conversation history must be a JSON array."
+        )
+
+    if not parsed:
         raise ValueError(
             "Conversation history must be a non-empty JSON array."
         )
@@ -131,45 +262,47 @@ def _parse_newconvo_payload(payload: str):
     normalized = []
 
     for index, item in enumerate(parsed):
-        sender = "me" if index % 2 == 0 else "incoming"
+        default_sender = (
+            "me"
+            if index % 2 == 0
+            else "incoming"
+        )
+
+        sender = default_sender
         content = item
 
         if isinstance(item, dict):
-            sender = str(
+            sender = _normalize_history_sender(
                 item.get(
                     "sender",
-                    item.get("role", sender),
-                )
-            ).strip().lower()
+                    item.get(
+                        "role",
+                        default_sender,
+                    ),
+                ),
+                default_sender,
+            )
 
             content = item.get(
                 "message",
-                item.get("content", ""),
+                item.get(
+                    "content",
+                    "",
+                ),
             )
 
-            if sender in {
-                "her",
-                "them",
-                "contact",
-                "incoming",
-            }:
-                sender = "incoming"
+        elif isinstance(item, str):
+            sender = default_sender
 
-            elif sender in {
-                "me",
-                "i",
-                "jeff",
-                "owner",
-            }:
-                sender = "me"
+        else:
+            raise ValueError(
+                f"History item {index + 1} must be either "
+                "a string or an object."
+            )
 
-            else:
-                raise ValueError(
-                    "Each history object must use sender/role "
-                    "'me' or 'incoming'."
-                )
+        content = str(content).strip()
 
-        if not str(content).strip():
+        if not content:
             raise ValueError(
                 f"History item {index + 1} is empty."
             )
@@ -177,37 +310,77 @@ def _parse_newconvo_payload(payload: str):
         normalized.append(
             (
                 sender,
-                str(content).strip(),
+                content,
             )
         )
 
     return name, normalized
 
 
-async def _send_analysis(source, contact, incoming: str):
+def _safe_float(value: Any, fallback: float = 0.0) -> float:
     """
-    Generate and render the analysis for an incoming contact message.
-
-    `source` may be either:
-      - discord.Message, from the custom on_message dispatcher
-      - commands.Context, from !reply
-
-    Both expose .reply(), but only Message has its own .id.
+    Convert arbitrary values to float without crashing analysis
+    when the model returns null, strings, or malformed values.
     """
+    if value is None:
+        return fallback
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _safe_int(value: Any, fallback: int = 3) -> int:
+    """
+    Convert arbitrary values to int safely.
+    """
+    if value is None:
+        return fallback
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+async def _send_analysis(
+    source,
+    contact,
+    incoming: str,
+):
+    """
+    Generate and render analysis for an incoming contact message.
+
+    `source` can be:
+        - discord.Message
+        - commands.Context
+
+    Both expose .reply().
+    """
+    contact_display_name: Optional[str] = None
+    result = None
+
     with SessionLocal() as db:
-        # Re-resolve the contact from the current DB session.
-        contact = (
-            find_contact(db, name=contact.display_name)
-            or find_contact(db, contact.display_name)
+        # Always re-resolve using the current session.
+        #
+        # Avoid the old positional fallback call because the database
+        # helper should be accessed consistently by keyword.
+        resolved_contact = find_contact(
+            db,
+            name=contact.display_name,
         )
 
-        if not contact:
+        if not resolved_contact:
             await source.reply(
                 "❌ That contact does not exist yet. "
-                'Create them with `!newconvo Name: ["your first message", '
-                '"their response"]`.'
+                'Create them with `!newconvo Name: '
+                '["your first message", "their response"]`.'
             )
             return
+
+        contact = resolved_contact
+        contact_display_name = contact.display_name
 
         set_active_contact(
             db,
@@ -215,8 +388,6 @@ async def _send_analysis(source, contact, incoming: str):
             commit=False,
         )
 
-        # Discord Message objects have .id directly.
-        # commands.Context objects do not, so safely handle both.
         external_message_id = getattr(
             source,
             "id",
@@ -251,10 +422,24 @@ async def _send_analysis(source, contact, incoming: str):
             incoming,
         )
 
-        for item in result.get(
+        if not isinstance(result, dict):
+            result = {}
+
+        # ---------------------------------------------------------
+        # Persist model-generated memory updates
+        # ---------------------------------------------------------
+        memory_updates = result.get(
             "memory_updates",
             [],
-        )[:12]:
+        )
+
+        if not isinstance(memory_updates, list):
+            memory_updates = []
+
+        for item in memory_updates[:12]:
+            if not isinstance(item, dict):
+                continue
+
             key = str(
                 item.get(
                     "key",
@@ -272,32 +457,34 @@ async def _send_analysis(source, contact, incoming: str):
             if not key or not value:
                 continue
 
-            try:
-                importance = int(
-                    item.get(
-                        "importance",
-                        3,
-                    )
-                    or 3
-                )
-            except (TypeError, ValueError):
-                importance = 3
+            importance = _safe_int(
+                item.get(
+                    "importance",
+                    3,
+                ),
+                fallback=3,
+            )
+
+            importance = max(
+                1,
+                min(
+                    5,
+                    importance,
+                ),
+            )
 
             upsert_memory(
                 db,
                 contact.id,
                 key,
                 value,
-                max(
-                    1,
-                    min(
-                        5,
-                        importance,
-                    ),
-                ),
+                importance,
                 incoming_message.id,
             )
 
+        # ---------------------------------------------------------
+        # Normalize result fields
+        # ---------------------------------------------------------
         vibe = result.get(
             "vibe",
             {},
@@ -314,77 +501,115 @@ async def _send_analysis(source, contact, incoming: str):
         if not isinstance(boredom, dict):
             boredom = {}
 
-        contact.relationship_stage = result.get(
+        relationship_stage = result.get(
             "relationship_stage",
             contact.relationship_stage,
         )
 
-        contact.vibe_score = float(
+        if relationship_stage:
+            contact.relationship_stage = str(
+                relationship_stage
+            ).strip()
+
+        contact.vibe_score = _safe_float(
             vibe.get(
                 "momentum",
                 contact.vibe_score,
-            )
-            or contact.vibe_score
+            ),
+            fallback=_safe_float(
+                contact.vibe_score,
+                0.0,
+            ),
         )
 
-        contact.engagement_score = float(
+        contact.engagement_score = _safe_float(
             vibe.get(
                 "reciprocity",
                 contact.engagement_score,
-            )
-            or contact.engagement_score
+            ),
+            fallback=_safe_float(
+                contact.engagement_score,
+                0.0,
+            ),
         )
 
-        contact.date_readiness = float(
+        contact.date_readiness = _safe_float(
             result.get(
                 "date_readiness",
                 contact.date_readiness,
-            )
-            or contact.date_readiness
+            ),
+            fallback=_safe_float(
+                contact.date_readiness,
+                0.0,
+            ),
         )
+
+        boredom_score = _safe_float(
+            boredom.get(
+                "score",
+                result.get(
+                    "boredom_score",
+                    0,
+                ),
+            ),
+            fallback=0.0,
+        )
+
+        boredom_reasons = boredom.get(
+            "reasons",
+            [],
+        )
+
+        if isinstance(boredom_reasons, list):
+            boredom_detail = str(
+                boredom_reasons
+            )
+        else:
+            boredom_detail = str(
+                boredom_reasons
+            )
 
         add_event(
             db,
             contact.id,
             "analysis",
-            detail=str(
-                boredom.get(
-                    "reasons",
-                    [],
-                )
-            ),
-            score=float(
-                boredom.get(
-                    "score",
-                    result.get(
-                        "boredom_score",
-                        0,
-                    ),
-                )
-                or 0
-            ),
+            detail=boredom_detail,
+            score=boredom_score,
         )
 
         db.commit()
 
+    # Do not rely on a SQLAlchemy ORM object after its session closes.
+    # Pass a stable display name into the renderer instead.
     await _render_analysis(
         source,
-        contact,
-        result,
+        contact_display_name or "Contact",
+        result or {},
     )
 
 
-async def _render_analysis(source, contact, result):
+async def _render_analysis(
+    source,
+    contact_display_name: str,
+    result: dict,
+):
     """
-    Render the generated relationship analysis.
-    Works with both Discord Message and Context objects.
+    Render generated relationship analysis.
     """
-    embed = discord.Embed(
-        title=f"💬 {contact.display_name}",
-        description=result.get(
+    reply_text = str(
+        result.get(
             "reply",
             "",
-        ),
+        )
+        or ""
+    )
+
+    if not reply_text:
+        reply_text = "No reply draft was generated."
+
+    embed = discord.Embed(
+        title=f"💬 {contact_display_name}",
+        description=reply_text[:4096],
     )
 
     embed.add_field(
@@ -394,7 +619,7 @@ async def _render_analysis(source, contact, result):
                 "relationship_stage",
                 "unknown",
             )
-        ),
+        )[:1024],
         inline=True,
     )
 
@@ -405,7 +630,7 @@ async def _render_analysis(source, contact, result):
                 "vibe",
                 "unknown",
             )
-        ),
+        )[:1024],
         inline=True,
     )
 
@@ -428,16 +653,18 @@ async def _render_analysis(source, contact, result):
                 "send_mode",
                 "text",
             )
-        ),
+        )[:1024],
         inline=True,
     )
 
     embed.add_field(
         name="Next move",
-        value=result.get(
-            "next_goal",
-            "Keep the interaction natural.",
-        ),
+        value=str(
+            result.get(
+                "next_goal",
+                "Keep the interaction natural.",
+            )
+        )[:1024],
         inline=False,
     )
 
@@ -446,36 +673,44 @@ async def _render_analysis(source, contact, result):
         [],
     )
 
-    if alternatives:
+    if isinstance(alternatives, list) and alternatives:
+        alternative_text = "\n\n".join(
+            str(item)
+            for item in alternatives[:2]
+        )
+
         embed.add_field(
             name="Alternative drafts",
-            value="\n\n".join(
-                str(x)
-                for x in alternatives[:2]
-            )[:1900],
+            value=alternative_text[:1900],
             inline=False,
         )
 
-    if result.get("voice_script"):
+    voice_script = result.get(
+        "voice_script",
+        "",
+    )
+
+    if voice_script:
         embed.add_field(
             name="🎙️ Voice-note draft",
-            value=str(
-                result["voice_script"]
-            )[:1000],
+            value=str(voice_script)[:1000],
             inline=False,
         )
 
-    if result.get("intimacy_guidance"):
+    intimacy_guidance = result.get(
+        "intimacy_guidance",
+        "",
+    )
+
+    if intimacy_guidance:
         embed.add_field(
             name="❤️ Intimacy guidance",
-            value=str(
-                result["intimacy_guidance"]
-            )[:1000],
+            value=str(intimacy_guidance)[:1000],
             inline=False,
         )
 
     await source.reply(
-        embed=embed
+        embed=embed,
     )
 
 
@@ -488,25 +723,24 @@ async def on_ready():
 
 
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     """
-    Custom dispatcher for the contact-addressed syntax.
+    Main dispatcher.
 
-    Supported for ANY persisted contact:
+    IMPORTANT ORDER:
 
-        !Esther: message
-        !Sarah: message
-        !Jessica: message
-        !Michael: message
-        !Any Contact Name: message
+    1. Ignore bots / unauthorized users.
+    2. Detect registered commands FIRST.
+    3. Process normal Discord commands.
+    4. Only then attempt dynamic contact syntax.
 
-    Explicit alias:
+    This means:
 
-        !contEsther: message
+        !newconvo Esther: ["Hi", "Hey!"]
 
-    Creation:
+    can NEVER become:
 
-        !newconvo Esther: ["my message", "their response"]
+        contact = "newconvo Esther"
     """
     if message.author.bot:
         return
@@ -519,11 +753,23 @@ async def on_message(message):
 
     content = message.content.strip()
 
+    if not content:
+        return
+
     # ---------------------------------------------------------
-    # Direct contact-addressed message
+    # CRITICAL FIX:
+    # Registered commands ALWAYS get first priority.
+    # ---------------------------------------------------------
+    if _is_registered_command(content):
+        await bot.process_commands(message)
+        return
+
+    # ---------------------------------------------------------
+    # Dynamic contact-addressed syntax
     #
     # !Esther: hello
     # !contEsther: hello
+    # !Sarah: what are you doing?
     # ---------------------------------------------------------
     parsed = _parse_contact_message(
         content
@@ -546,11 +792,6 @@ async def on_message(message):
                 )
                 return
 
-        # IMPORTANT:
-        # Pass the Discord Message directly.
-        #
-        # _send_analysis() now knows a Message already has .id,
-        # so it will NOT attempt message.message.id.
         await _send_analysis(
             message,
             contact,
@@ -558,16 +799,14 @@ async def on_message(message):
         )
         return
 
-    # Let normal registered Discord commands handle everything else.
-    await bot.process_commands(
-        message
-    )
+    # Anything else goes through regular Discord command handling.
+    await bot.process_commands(message)
 
 
 @bot.command(name="newconvo")
 @owner_only()
 async def newconvo(
-    ctx,
+    ctx: commands.Context,
     *,
     payload: str,
 ):
@@ -575,11 +814,18 @@ async def newconvo(
     Create a contact and optionally seed their complete
     conversation history.
 
-    Example:
+    Examples:
+
+        !newconvo Esther
 
         !newconvo Esther: ["Hey Esther", "Hey!", "How are you?"]
 
-    Any contact name works.
+    Explicit sender objects are also supported:
+
+        !newconvo Esther: [
+            {"sender": "me", "content": "Hey Esther"},
+            {"sender": "incoming", "content": "Hey!"}
+        ]
     """
     try:
         name, history = _parse_newconvo_payload(
@@ -594,6 +840,14 @@ async def newconvo(
     if not name:
         await ctx.reply(
             "❌ A contact name is required."
+        )
+        return
+
+    # Prevent accidental creation of a contact whose name is
+    # actually a reserved command.
+    if name.casefold() in KNOWN_COMMANDS:
+        await ctx.reply(
+            f"❌ **{name}** is reserved as a bot command."
         )
         return
 
@@ -637,34 +891,45 @@ async def newconvo(
             contact.id,
             "conversation_created",
             detail=(
-                f"seeded_messages="
+                "seeded_messages="
                 f"{len(history or [])}"
             ),
         )
 
         db.commit()
 
-    seeded = len(
-        history or []
-    )
+        # Capture before leaving the session.
+        display_name = contact.display_name
+
+    seeded = len(history or [])
 
     await ctx.reply(
         f"✅ Created and activated "
-        f"**{contact.display_name}**.\n"
+        f"**{display_name}**.\n"
         f"Persisted `{seeded}` message"
         f"{'s' if seeded != 1 else ''}.\n"
-        f"Use `!{contact.display_name}: "
-        f"their next message` whenever they message you."
+        f"Use `!{display_name}: their next message` "
+        f"whenever they message you."
     )
 
 
 @bot.command(name="deleteconvo")
 @owner_only()
 async def deleteconvo(
-    ctx,
+    ctx: commands.Context,
     *,
     name: str,
 ):
+    name = " ".join(
+        name.strip().split()
+    )
+
+    if not name:
+        await ctx.reply(
+            "❌ A contact name is required."
+        )
+        return
+
     with SessionLocal() as db:
         contact = find_contact(
             db,
@@ -694,11 +959,9 @@ async def deleteconvo(
 
 @bot.command(name="active")
 @owner_only()
-async def active(ctx):
+async def active(ctx: commands.Context):
     with SessionLocal() as db:
-        contact = get_active_contact(
-            db
-        )
+        contact = get_active_contact(db)
 
         if not contact:
             await ctx.reply(
@@ -706,48 +969,57 @@ async def active(ctx):
             )
             return
 
-        await ctx.reply(
-            f"🎯 Active: **{contact.display_name}**\n"
-            f"Stage: `{contact.relationship_stage}`"
-        )
+        display_name = contact.display_name
+        relationship_stage = contact.relationship_stage
+
+    await ctx.reply(
+        f"🎯 Active: **{display_name}**\n"
+        f"Stage: `{relationship_stage}`"
+    )
 
 
 @bot.command(name="reply")
 @owner_only()
 async def reply(
-    ctx,
+    ctx: commands.Context,
     *,
     incoming: str,
 ):
     """
     Backward-compatible manual command.
 
-    New preferred syntax is:
+    Preferred syntax:
 
-        !Name: their message
+        !Esther: their message
     """
     with SessionLocal() as db:
-        contact = get_active_contact(
-            db
-        )
+        contact = get_active_contact(db)
 
-    if not contact:
-        await ctx.reply(
-            "❌ No active contact. "
-            "Use `!Name: their message` instead."
-        )
-        return
+        if not contact:
+            await ctx.reply(
+                "❌ No active contact. "
+                "Use `!Name: their message` instead."
+            )
+            return
+
+        # Capture the name while the DB session is alive.
+        contact_display_name = contact.display_name
+
+    # Re-resolve inside _send_analysis using the current session.
+    class ContactRef:
+        def __init__(self, display_name: str):
+            self.display_name = display_name
 
     await _send_analysis(
         ctx,
-        contact,
+        ContactRef(contact_display_name),
         incoming,
     )
 
 
 @bot.command(name="helpme")
 @owner_only()
-async def helpme(ctx):
+async def helpme(ctx: commands.Context):
     await ctx.reply(
         "**Relationship Copilot commands**\n\n"
         "`!newconvo Esther: [\"Hi Esther\", \"Hey!\"]` "
@@ -759,9 +1031,49 @@ async def helpme(ctx):
         "`!deleteconvo Esther` "
         "— permanently delete contact + history\n"
         "`!active` "
-        "— show the most recently addressed contact\n\n"
-        "**Any contact name works.**"
+        "— show the most recently addressed contact\n"
+        "`!reply their message` "
+        "— analyze against the active contact\n\n"
+        "**Any existing contact name works.**\n"
+        "**Commands always take priority over contact syntax.**"
     )
+
+
+async def _handle_command_error(
+    ctx: commands.Context,
+    error: commands.CommandError,
+):
+    """
+    Keep command failures human-readable instead of dumping
+    Discord.py exception text into the channel.
+    """
+    if isinstance(error, commands.CheckFailure):
+        return
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(
+            "❌ Missing required argument. Use `!helpme` "
+            "to see the command format."
+        )
+        return
+
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    await ctx.reply(
+        f"❌ Command error: {error}"
+    )
+
+    print(
+        f"Discord command error in "
+        f"{getattr(ctx.command, 'name', 'unknown')}: {error}"
+    )
+
+
+bot.add_listener(
+    _handle_command_error,
+    "on_command_error",
+)
 
 
 def run():
