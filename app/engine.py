@@ -133,6 +133,8 @@ NVIDIA_CLIENTS = [
     OpenAI(
         api_key=key,
         base_url=NVIDIA_BASE_URL,
+        timeout=90.0,
+        max_retries=0,
     )
     for key in NVIDIA_API_KEYS
 ]
@@ -184,6 +186,7 @@ def _rotate_key() -> None:
     With one key this is a no-op.
     With multiple keys the position wraps around.
     """
+
     global _current_key_index
 
     if len(NVIDIA_CLIENTS) <= 1:
@@ -350,6 +353,7 @@ def _nvidia_complete(
       - jitter
       - bounded retries
       - optional Nemotron reasoning
+      - bounded HTTP timeout
     """
 
     max_attempts = max(
@@ -1067,6 +1071,45 @@ question truthfully himself.
 Ordinary conversation should contain no AI terminology.
 
 ============================================================
+METADATA DECISION MODEL
+============================================================
+
+The conversational metadata is internal application state.
+
+It must be based on the actual message, conversation history,
+memories, and relationship context.
+
+Do not fill metadata with zeros just because zero is an easy
+default.
+
+"next_move" means the most immediate thing Jefferey should do
+after reading her current message.
+
+Examples:
+
+- "Reply warmly and leave the conversation open."
+- "Answer her question directly, then stop there."
+- "Share the related story instead of asking another question."
+- "Use a little humor and let her respond."
+- "Ask one genuine follow-up about the part that caught your attention."
+- "Give her some breathing room and do not push the conversation."
+- "Make a relaxed invitation if she clearly opens that door."
+- "Back off from intimacy and return to ordinary conversation."
+
+"next_goal" means the broader conversational direction.
+
+Examples:
+
+- "Let the conversation breathe."
+- "Build more reciprocal warmth."
+- "Learn more about what she is actually interested in."
+- "Let mutual flirting develop naturally."
+- "Move toward a low-pressure date when appropriate."
+- "Reduce pressure and restore natural rhythm."
+
+They are related but NOT interchangeable.
+
+============================================================
 THE MOST IMPORTANT RULE
 ============================================================
 
@@ -1116,6 +1159,7 @@ Use exactly this structure:
   "date_readiness": 0,
   "relationship_stage": "new",
   "conversation_mode": "react",
+  "next_move": "",
   "next_goal": "",
   "question_strategy": "",
   "memory_updates": [
@@ -1166,10 +1210,14 @@ Important:
 "alternatives" must be genuine alternative messages,
 not explanations.
 
+"next_move" is the immediate internal action recommendation.
+
+"next_goal" is the broader conversational direction.
+
 "intimacy_guidance" is metadata for the application and must
 never appear in the actual conversational message.
 
-"positive_signals", "concerns", "next_goal",
+"positive_signals", "concerns", "next_move", "next_goal",
 "question_strategy", "memory_updates", and "safety_note"
 are metadata only.
 
@@ -1284,6 +1332,26 @@ def _clamp_score(
             value,
         ),
     )
+
+
+def _normalize_string(
+    value: Any,
+    default: str = "",
+) -> str:
+    """
+    Normalize an arbitrary value into a trimmed string.
+    """
+
+    if value is None:
+        return default
+
+    if not isinstance(
+        value,
+        str,
+    ):
+        value = str(value)
+
+    return value.strip()
 
 
 # ============================================================
@@ -1494,6 +1562,18 @@ supports it based on mutual participation and context.
 
 Then send that message naturally.
 
+IMPORTANT METADATA DISTINCTION:
+
+next_move = the most immediate action Jefferey should take
+after reading her current message.
+
+next_goal = the broader conversational direction.
+
+They are separate fields.
+
+Do not leave next_move blank when there is a clear immediate
+action to take.
+
 The application's metadata must describe the situation
 accurately, but metadata must never leak into the reply.
 """
@@ -1616,16 +1696,8 @@ def generate_reply(
         "",
     )
 
-    if not isinstance(
+    data["reply"] = _normalize_string(
         reply_text,
-        str,
-    ):
-        reply_text = str(
-            reply_text
-        )
-
-    data["reply"] = (
-        reply_text.strip()
     )
 
     # ========================================================
@@ -1649,9 +1721,9 @@ def generate_reply(
         if item is None:
             continue
 
-        value = str(
-            item
-        ).strip()
+        value = _normalize_string(
+            item,
+        )
 
         if value:
             normalized_alternatives.append(
@@ -1686,19 +1758,19 @@ def generate_reply(
         ):
             continue
 
-        key = str(
+        key = _normalize_string(
             item.get(
                 "key",
                 "",
             )
-        ).strip()
+        )
 
-        value = str(
+        value = _normalize_string(
             item.get(
                 "value",
                 "",
             )
-        ).strip()
+        )
 
         if not key or not value:
             continue
@@ -1772,6 +1844,10 @@ def generate_reply(
             model_reciprocity
         )
 
+    # ========================================================
+    # Vibe normalization
+    # ========================================================
+
     model_vibe = data.get(
         "vibe"
     )
@@ -1788,6 +1864,30 @@ def generate_reply(
         )
     else:
         data["vibe"] = fallback_vibe
+
+    # ========================================================
+    # Conversation mode
+    # ========================================================
+
+    allowed_conversation_modes = {
+        "react",
+        "share",
+        "curiosity",
+        "play",
+        "deepen",
+        "lighten",
+        "space",
+    }
+
+    if (
+        data.get(
+            "conversation_mode"
+        )
+        not in allowed_conversation_modes
+    ):
+        data["conversation_mode"] = (
+            "react"
+        )
 
     # ========================================================
     # Deterministic conversation adjustments
@@ -1808,11 +1908,22 @@ def generate_reply(
         )
 
         if not data.get(
+            "next_move"
+        ):
+            data["next_move"] = (
+                "Ease off the pressure and change the rhythm naturally."
+            )
+
+        if not data.get(
             "next_goal"
         ):
             data["next_goal"] = (
                 "Let the conversation breathe or naturally change direction."
             )
+
+    # ========================================================
+    # Date readiness
+    # ========================================================
 
     date_readiness = _clamp_score(
         data.get(
@@ -1837,14 +1948,44 @@ def generate_reply(
         }
     ):
         if not data.get(
-            "next_goal"
+            "next_move"
         ):
-            data["next_goal"] = (
+            data["next_move"] = (
                 "Make one relaxed invitation if the conversation naturally opens the door."
             )
 
+        if not data.get(
+            "next_goal"
+        ):
+            data["next_goal"] = (
+                "Move toward a low-pressure date when the opening is genuine."
+            )
+
     # ========================================================
-    # Ensure array fields
+    # Intimacy safety / metadata guidance
+    # ========================================================
+
+    intimacy_guidance = _normalize_string(
+        data.get(
+            "intimacy_guidance",
+            "",
+        )
+    )
+
+    data["intimacy_guidance"] = (
+        intimacy_guidance
+    )
+
+    if (
+        data["vibe"] == "sexual"
+        and not data["intimacy_guidance"]
+    ):
+        data["intimacy_guidance"] = (
+            "Mutual intimate energy may be present; keep escalation gradual and reciprocal."
+        )
+
+    # ========================================================
+    # Arrays
     # ========================================================
 
     for field in (
@@ -1865,61 +2006,13 @@ def generate_reply(
             ]
 
         data[field] = [
-            str(item).strip()
+            _normalize_string(item)
             for item in value
-            if str(item).strip()
+            if _normalize_string(item)
         ]
 
     # ========================================================
-    # Normalize intimacy guidance
-    # ========================================================
-
-    intimacy_guidance = data.get(
-        "intimacy_guidance",
-        "",
-    )
-
-    if intimacy_guidance is None:
-        intimacy_guidance = ""
-
-    if not isinstance(
-        intimacy_guidance,
-        str,
-    ):
-        intimacy_guidance = str(
-            intimacy_guidance
-        )
-
-    data["intimacy_guidance"] = (
-        intimacy_guidance.strip()
-    )
-
-    # ========================================================
-    # Normalize safety note
-    # ========================================================
-
-    safety_note = data.get(
-        "safety_note",
-        "",
-    )
-
-    if safety_note is None:
-        safety_note = ""
-
-    if not isinstance(
-        safety_note,
-        str,
-    ):
-        safety_note = str(
-            safety_note
-        )
-
-    data["safety_note"] = (
-        safety_note.strip()
-    )
-
-    # ========================================================
-    # Ensure allowed metadata values
+    # Allowed vibe values
     # ========================================================
 
     allowed_vibes = {
@@ -1935,6 +2028,10 @@ def generate_reply(
         "vibe"
     ) not in allowed_vibes:
         data["vibe"] = fallback_vibe
+
+    # ========================================================
+    # Relationship stage
+    # ========================================================
 
     allowed_relationship_stages = {
         "new",
@@ -1966,26 +2063,6 @@ def generate_reply(
         relationship_stage
     )
 
-    allowed_conversation_modes = {
-        "react",
-        "share",
-        "curiosity",
-        "play",
-        "deepen",
-        "lighten",
-        "space",
-    }
-
-    if (
-        data.get(
-            "conversation_mode"
-        )
-        not in allowed_conversation_modes
-    ):
-        data["conversation_mode"] = (
-            "react"
-        )
-
     # ========================================================
     # Ensure scalar fields
     # ========================================================
@@ -2004,6 +2081,7 @@ def generate_reply(
             or "new"
         ),
         "conversation_mode": "react",
+        "next_move": "",
         "next_goal": "",
         "question_strategy": "",
         "intimacy_guidance": "",
@@ -2017,34 +2095,70 @@ def generate_reply(
             data[field] = default
 
     # ========================================================
-    # Force string metadata where appropriate
+    # Normalize scalar metadata
     # ========================================================
 
     for field in (
         "send_mode",
         "voice_script",
         "voice_reason",
+        "next_move",
         "next_goal",
         "question_strategy",
         "intimacy_guidance",
         "safety_note",
     ):
-        value = data.get(
-            field,
-            "",
+        data[field] = _normalize_string(
+            data.get(
+                field,
+                "",
+            )
         )
 
-        if not isinstance(
-            value,
-            str,
-        ):
-            value = str(
-                value
+    # ========================================================
+    # Ensure a useful next_move exists
+    # ========================================================
+
+    if not data["next_move"]:
+        conversation_mode = data.get(
+            "conversation_mode",
+            "react",
+        )
+
+        if conversation_mode == "share":
+            data["next_move"] = (
+                "Share something relevant from Jefferey's own side of the conversation."
             )
 
-        data[field] = (
-            value.strip()
-        )
+        elif conversation_mode == "curiosity":
+            data["next_move"] = (
+                "Ask one genuine follow-up question about what actually caught Jefferey's attention."
+            )
+
+        elif conversation_mode == "play":
+            data["next_move"] = (
+                "Keep the exchange light and playful without forcing the conversation."
+            )
+
+        elif conversation_mode == "deepen":
+            data["next_move"] = (
+                "Respond honestly to the deeper emotional part of what she shared."
+            )
+
+        elif conversation_mode == "lighten":
+            data["next_move"] = (
+                "Lighten the rhythm naturally and avoid stacking more questions."
+            )
+
+        elif conversation_mode == "space":
+            data["next_move"] = (
+                "Give the conversation room instead of pushing for another response."
+            )
+
+        else:
+            data["next_move"] = (
+                "React naturally to what she just said and let the conversation develop from there."
+            )
 
     # ========================================================
     # Final validation
