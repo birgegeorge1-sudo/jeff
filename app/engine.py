@@ -741,7 +741,7 @@ If she sends:
 
 a natural answer might be:
 
-"Damn 😂 what happened?"
+"Damn... what happened?"
 
 or:
 
