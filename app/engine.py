@@ -67,12 +67,21 @@ REASONING_BUDGET = max(
 # Persona
 # ============================================================
 
-with open(
-    PERSONA_PATH,
-    "r",
-    encoding="utf-8",
-) as f:
-    PERSONA = json.load(f)
+try:
+    with open(
+        PERSONA_PATH,
+        "r",
+        encoding="utf-8",
+    ) as f:
+        PERSONA = json.load(f)
+except FileNotFoundError as exc:
+    raise RuntimeError(
+        f"Persona file not found: {PERSONA_PATH}"
+    ) from exc
+except json.JSONDecodeError as exc:
+    raise RuntimeError(
+        f"Persona file contains invalid JSON: {PERSONA_PATH}"
+    ) from exc
 
 
 # ============================================================
@@ -459,7 +468,8 @@ Then answer naturally.
 The private reasoning can consider the entire conversation,
 your memories, the relationship, emotional signals, timing,
 whether to joke, whether to ask something, whether to flirt,
-whether to give space, and what matters.
+whether to give space, what matters to her, whether intimacy
+is appropriate, and what matters to the relationship.
 
 But NONE of that analysis should appear in the message.
 
@@ -562,6 +572,8 @@ Would I be warmer here?
 
 Would I flirt here?
 
+Would intimacy actually fit this moment?
+
 Would that actually sound like me?
 
 Then respond.
@@ -586,7 +598,7 @@ Sometimes the right reply is:
 
 Sometimes:
 
-"Damn 😂 what happened?"
+"Damn... what happened?"
 
 Sometimes:
 
@@ -901,6 +913,7 @@ Notice:
 - whether she keeps conversations going
 - whether she becomes more open
 - whether she seems interested in meeting
+- whether romantic or intimate energy is actually reciprocal
 
 Do not assume romantic interest merely because she is friendly.
 
@@ -943,6 +956,9 @@ INTIMACY
 
 Both people are adults.
 
+Intimacy must develop naturally through mutual participation,
+comfort, trust, attraction, and clear reciprocal interest.
+
 Romantic or sexual conversation can become more intimate when
 both sides are clearly participating.
 
@@ -950,10 +966,40 @@ Do not force sexual escalation.
 
 Do not interpret silence as consent.
 
+Do not treat politeness, friendliness, affection, or ordinary
+conversation as evidence that sexual escalation is wanted.
+
 Do not pressure for sexual images.
 
+Do not repeatedly return to sexual topics when she is not
+reciprocating.
+
 If she becomes uncomfortable, backs away, says no, asks you to
-slow down, or stops reciprocating, back off naturally.
+slow down, changes the subject, becomes noticeably less
+responsive, or stops reciprocating, back off naturally.
+
+Do not guilt her.
+
+Do not make her feel responsible for your emotions.
+
+Do not use jealousy, pressure, withdrawal, threats, or
+manipulation to create intimacy.
+
+When intimacy is appropriate, it should feel conversational,
+mutual, relaxed, and consistent with the relationship.
+
+The "intimacy_guidance" field is internal application metadata.
+It should briefly describe the current intimacy situation,
+such as:
+
+- no intimacy escalation indicated
+- light romantic warmth is appropriate
+- mutual flirting is present
+- intimacy should remain gradual
+- she appears uncomfortable, so back off
+- she is reciprocating clearly, but do not rush
+
+Do not put this guidance inside "reply".
 
 ============================================================
 MEMORY
@@ -1113,13 +1159,26 @@ deepen
 lighten
 space
 
+Important:
+
+"reply" is the actual message Jefferey sends.
+
+"alternatives" must be genuine alternative messages,
+not explanations.
+
+"intimacy_guidance" is metadata for the application and must
+never appear in the actual conversational message.
+
+"positive_signals", "concerns", "next_goal",
+"question_strategy", "memory_updates", and "safety_note"
+are metadata only.
+
+Never leak metadata into "reply".
+
 The "reply" field is the only thing that matters for how Jefferey
 actually sounds.
 
 Make it feel like a real text message from him.
-
-The metadata exists for the application and must not leak into
-the actual reply.
 """
 
 
@@ -1237,8 +1296,9 @@ def deterministic_signals(
 ):
     """
     Lightweight deterministic signals used as safeguards and
-    fallbacks. The model remains responsible for understanding
-    semantic context.
+    fallbacks.
+
+    The model remains responsible for semantic understanding.
     """
 
     text = incoming.strip()
@@ -1386,7 +1446,11 @@ I AM JEFFEREY.
 Here is who I am:
 
 PERSONA:
-{json.dumps(PERSONA, ensure_ascii=False, indent=2)}
+{json.dumps(
+    PERSONA,
+    ensure_ascii=False,
+    indent=2,
+)}
 
 CURRENT WOMAN I AM TALKING TO:
 name: {contact.display_name}
@@ -1414,7 +1478,24 @@ Before answering, privately ask:
 "How would I actually say this right now if I were sitting
 here having a real conversation with this woman?"
 
-Then send that message.
+Also privately consider whether this is:
+
+- ordinary conversation
+- warming
+- flirting
+- romantic
+- emotionally deeper
+- potentially intimate
+
+Do not force escalation.
+
+If intimacy is relevant, decide whether the moment actually
+supports it based on mutual participation and context.
+
+Then send that message naturally.
+
+The application's metadata must describe the situation
+accurately, but metadata must never leak into the reply.
 """
 
 
@@ -1432,8 +1513,10 @@ def generate_reply(
     Generate a natural first-person Jefferey response.
 
     The model handles semantic interpretation and contextual
-    decision-making. Deterministic logic only provides fallback
-    signals and safety-oriented normalization.
+    decision-making.
+
+    Deterministic logic only provides fallback signals and
+    normalization.
     """
 
     boredom, reciprocity, fallback_vibe = (
@@ -1689,10 +1772,22 @@ def generate_reply(
             model_reciprocity
         )
 
-    data["vibe"] = (
-        data.get("vibe")
-        or fallback_vibe
+    model_vibe = data.get(
+        "vibe"
     )
+
+    if (
+        isinstance(
+            model_vibe,
+            str,
+        )
+        and model_vibe.strip()
+    ):
+        data["vibe"] = (
+            model_vibe.strip()
+        )
+    else:
+        data["vibe"] = fallback_vibe
 
     # ========================================================
     # Deterministic conversation adjustments
@@ -1776,6 +1871,122 @@ def generate_reply(
         ]
 
     # ========================================================
+    # Normalize intimacy guidance
+    # ========================================================
+
+    intimacy_guidance = data.get(
+        "intimacy_guidance",
+        "",
+    )
+
+    if intimacy_guidance is None:
+        intimacy_guidance = ""
+
+    if not isinstance(
+        intimacy_guidance,
+        str,
+    ):
+        intimacy_guidance = str(
+            intimacy_guidance
+        )
+
+    data["intimacy_guidance"] = (
+        intimacy_guidance.strip()
+    )
+
+    # ========================================================
+    # Normalize safety note
+    # ========================================================
+
+    safety_note = data.get(
+        "safety_note",
+        "",
+    )
+
+    if safety_note is None:
+        safety_note = ""
+
+    if not isinstance(
+        safety_note,
+        str,
+    ):
+        safety_note = str(
+            safety_note
+        )
+
+    data["safety_note"] = (
+        safety_note.strip()
+    )
+
+    # ========================================================
+    # Ensure allowed metadata values
+    # ========================================================
+
+    allowed_vibes = {
+        "flat",
+        "warming",
+        "playful",
+        "deep",
+        "romantic",
+        "sexual",
+    }
+
+    if data.get(
+        "vibe"
+    ) not in allowed_vibes:
+        data["vibe"] = fallback_vibe
+
+    allowed_relationship_stages = {
+        "new",
+        "warming",
+        "interested",
+        "flirting",
+        "date_ready",
+        "cooling_off",
+    }
+
+    relationship_stage = data.get(
+        "relationship_stage"
+    )
+
+    if relationship_stage not in allowed_relationship_stages:
+        relationship_stage = (
+            getattr(
+                contact,
+                "relationship_stage",
+                "new",
+            )
+            or "new"
+        )
+
+    if relationship_stage not in allowed_relationship_stages:
+        relationship_stage = "new"
+
+    data["relationship_stage"] = (
+        relationship_stage
+    )
+
+    allowed_conversation_modes = {
+        "react",
+        "share",
+        "curiosity",
+        "play",
+        "deepen",
+        "lighten",
+        "space",
+    }
+
+    if (
+        data.get(
+            "conversation_mode"
+        )
+        not in allowed_conversation_modes
+    ):
+        data["conversation_mode"] = (
+            "react"
+        )
+
+    # ========================================================
     # Ensure scalar fields
     # ========================================================
 
@@ -1800,8 +2011,40 @@ def generate_reply(
     }
 
     for field, default in defaults.items():
-        if data.get(field) is None:
+        if data.get(
+            field
+        ) is None:
             data[field] = default
+
+    # ========================================================
+    # Force string metadata where appropriate
+    # ========================================================
+
+    for field in (
+        "send_mode",
+        "voice_script",
+        "voice_reason",
+        "next_goal",
+        "question_strategy",
+        "intimacy_guidance",
+        "safety_note",
+    ):
+        value = data.get(
+            field,
+            "",
+        )
+
+        if not isinstance(
+            value,
+            str,
+        ):
+            value = str(
+                value
+            )
+
+        data[field] = (
+            value.strip()
+        )
 
     # ========================================================
     # Final validation
