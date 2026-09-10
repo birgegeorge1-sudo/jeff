@@ -1,9 +1,8 @@
 fastapi>=0.115
 uvicorn[standard]>=0.34
-mistralai>=1.8
+openai
 SQLAlchemy>=2.0
 mysql-connector-python>=9.0
 pydantic>=2.10
 python-dotenv>=1.0
 discord.py>=2.6,<3
-
