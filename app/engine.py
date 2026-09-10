@@ -4,7 +4,7 @@ import random
 import time
 from typing import Any, Optional
 
-from mistralai.client import Mistral
+from openai import OpenAI
 
 
 # ============================================================
@@ -13,7 +13,12 @@ from mistralai.client import Mistral
 
 MODEL = os.getenv(
     "MODEL",
-    "mistral-large-latest",
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
+)
+
+NVIDIA_BASE_URL = os.getenv(
+    "NVIDIA_BASE_URL",
+    "https://integrate.api.nvidia.com/v1",
 )
 
 PERSONA_PATH = os.getenv(
@@ -23,6 +28,39 @@ PERSONA_PATH = os.getenv(
             os.path.dirname(__file__)
         ),
         "persona.json",
+    ),
+)
+
+# Nemotron 3.5 Lightning supports reasoning.
+# Keep this configurable through environment variables.
+ENABLE_THINKING = os.getenv(
+    "ENABLE_THINKING",
+    "true",
+).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+try:
+    REASONING_BUDGET = int(
+        os.getenv(
+            "REASONING_BUDGET",
+            "8192",
+        )
+    )
+except (
+    TypeError,
+    ValueError,
+):
+    REASONING_BUDGET = 8192
+
+REASONING_BUDGET = max(
+    -1,
+    min(
+        32768,
+        REASONING_BUDGET,
     ),
 )
 
@@ -40,34 +78,42 @@ with open(
 
 
 # ============================================================
-# Mistral API key pool
+# NVIDIA API key pool
 #
-# ONLY configuration required:
+# Required:
 #
-#   MISTRAL_API_KEYS=key1,key2,key3,key4
+#   NVIDIA_API_KEY=your_key_here
 #
-# Keys are comma-separated.
+# Optional future multi-key support:
 #
-# Example:
+#   NVIDIA_API_KEYS=key1,key2,key3
 #
-#   MISTRAL_API_KEYS=abc123,def456,ghi789
+# If NVIDIA_API_KEYS exists, it takes precedence over the
+# single NVIDIA_API_KEY value.
 #
-# Whitespace surrounding keys is ignored.
+# Whitespace is ignored.
 # Duplicate keys are removed.
 # ============================================================
 
-def _load_mistral_keys() -> list[str]:
-    raw_keys = os.getenv(
-        "MISTRAL_API_KEYS",
+def _load_nvidia_keys() -> list[str]:
+    raw_pool = os.getenv(
+        "NVIDIA_API_KEYS",
         "",
     ).strip()
 
-    if not raw_keys:
-        return []
+    if raw_pool:
+        raw_values = raw_pool.split(",")
+    else:
+        raw_values = [
+            os.getenv(
+                "NVIDIA_API_KEY",
+                "",
+            )
+        ]
 
     keys: list[str] = []
 
-    for raw_key in raw_keys.split(","):
+    for raw_key in raw_values:
         key = raw_key.strip()
 
         if not key:
@@ -81,26 +127,47 @@ def _load_mistral_keys() -> list[str]:
     return keys
 
 
-MISTRAL_API_KEYS = _load_mistral_keys()
+NVIDIA_API_KEYS = _load_nvidia_keys()
 
-if not MISTRAL_API_KEYS:
+if not NVIDIA_API_KEYS:
     raise RuntimeError(
-        "No Mistral API keys configured. "
-        "Set the MISTRAL_API_KEYS environment variable "
-        "to a comma-separated list of API keys."
+        "No NVIDIA API key configured. "
+        "Set NVIDIA_API_KEY or NVIDIA_API_KEYS."
     )
 
 
-MISTRAL_CLIENTS = [
-    Mistral(api_key=key)
-    for key in MISTRAL_API_KEYS
+NVIDIA_CLIENTS = [
+    OpenAI(
+        api_key=key,
+        base_url=NVIDIA_BASE_URL,
+    )
+    for key in NVIDIA_API_KEYS
 ]
 
 
 print(
-    "[Mistral] Loaded "
-    f"{len(MISTRAL_CLIENTS)} API key(s) "
-    "from MISTRAL_API_KEYS."
+    "[NVIDIA] Loaded "
+    f"{len(NVIDIA_CLIENTS)} API key(s)."
+)
+
+print(
+    "[NVIDIA] Model: "
+    f"{MODEL}"
+)
+
+print(
+    "[NVIDIA] Base URL: "
+    f"{NVIDIA_BASE_URL}"
+)
+
+print(
+    "[NVIDIA] Thinking: "
+    f"{ENABLE_THINKING}"
+)
+
+print(
+    "[NVIDIA] Reasoning budget: "
+    f"{REASONING_BUDGET}"
 )
 
 
@@ -111,27 +178,27 @@ print(
 _current_key_index = 0
 
 
-def _current_client():
-    return MISTRAL_CLIENTS[
+def _current_client() -> OpenAI:
+    return NVIDIA_CLIENTS[
         _current_key_index
     ]
 
 
 def _rotate_key() -> None:
     """
-    Move to the next configured Mistral API key.
+    Move to the next configured NVIDIA API key.
 
     With one key this is a no-op.
     With multiple keys the position wraps around.
     """
     global _current_key_index
 
-    if len(MISTRAL_CLIENTS) <= 1:
+    if len(NVIDIA_CLIENTS) <= 1:
         return
 
     _current_key_index = (
         _current_key_index + 1
-    ) % len(MISTRAL_CLIENTS)
+    ) % len(NVIDIA_CLIENTS)
 
 
 # ============================================================
@@ -143,7 +210,7 @@ def _extract_status_code(
 ) -> Optional[int]:
     """
     Try several locations used by different versions of the
-    Mistral SDK / HTTP stack to expose the HTTP status code.
+    OpenAI SDK / HTTP stack to expose the HTTP status code.
     """
 
     status_code = getattr(
@@ -160,28 +227,6 @@ def _extract_status_code(
             ValueError,
         ):
             pass
-
-    http_response = getattr(
-        exc,
-        "http_res",
-        None,
-    )
-
-    if http_response is not None:
-        status_code = getattr(
-            http_response,
-            "status_code",
-            None,
-        )
-
-        if status_code is not None:
-            try:
-                return int(status_code)
-            except (
-                TypeError,
-                ValueError,
-            ):
-                pass
 
     response = getattr(
         exc,
@@ -205,6 +250,28 @@ def _extract_status_code(
             ):
                 pass
 
+    http_response = getattr(
+        exc,
+        "http_res",
+        None,
+    )
+
+    if http_response is not None:
+        status_code = getattr(
+            http_response,
+            "status_code",
+            None,
+        )
+
+        if status_code is not None:
+            try:
+                return int(status_code)
+            except (
+                TypeError,
+                ValueError,
+            ):
+                pass
+
     return None
 
 
@@ -212,8 +279,8 @@ def _is_rate_limited(
     exc: Exception,
 ) -> bool:
     """
-    Detect Mistral HTTP 429 / rate-limited responses without
-    depending on one exact SDK exception class.
+    Detect HTTP 429 / rate-limited responses without depending
+    on one exact exception class.
     """
 
     status_code = _extract_status_code(
@@ -230,10 +297,9 @@ def _is_rate_limited(
         "rate limit",
         "rate_limited",
         "too many requests",
-        "code\": \"1300",
-        "code': '1300",
-        "code=1300",
-        '"code":1300',
+        "throttled",
+        "quota exceeded",
+        "quota_exceeded",
     )
 
     return any(
@@ -255,63 +321,65 @@ def _retry_delay(
         attempt 3 -> 8 sec
         attempt 4 -> 16 sec
         ...
-    capped at 30 seconds.
+    capped at 60 seconds.
 
-    Jitter avoids synchronized retry bursts.
+    Jitter prevents synchronized retry bursts.
     """
 
     base = min(
-        30.0,
+        60.0,
         2.0 ** attempt,
     )
 
     jitter = random.uniform(
         0.0,
-        0.75,
+        1.0,
     )
 
     return base + jitter
 
 
 # ============================================================
-# Centralized Mistral completion handler
+# Centralized NVIDIA completion handler
 # ============================================================
 
-def _mistral_complete(
+def _nvidia_complete(
     *,
     messages: list[dict[str, Any]],
     temperature: float = 0.55,
-    response_format: Optional[
-        dict[str, Any]
-    ] = None,
     max_tokens: Optional[int] = None,
 ):
     """
-    Centralized Mistral request handler.
+    Centralized NVIDIA request handler.
 
     Features:
-
-      - multiple API-key support
-      - comma-separated MISTRAL_API_KEYS
+      - NVIDIA OpenAI-compatible API
+      - optional multiple API keys
       - automatic key rotation
       - HTTP 429 detection
       - exponential backoff
       - jitter
       - bounded retries
+      - optional Nemotron reasoning
       - non-429 errors are preserved
 
-    Every rate-limited attempt advances to the next key.
+    NVIDIA currently documents:
+      model:
+        nvidia/nemotron-3.5-lightning-30b-a3b
 
-    The same request is retried until:
-      - a request succeeds, or
-      - all retry attempts are exhausted.
+      endpoint:
+        https://integrate.api.nvidia.com/v1
+
+      reasoning:
+        reasoning_budget
+        chat_template_kwargs.enable_thinking
     """
 
-    # Two passes through the configured pool at most,
+    # Two passes through configured keys at most,
     # while guaranteeing at least three attempts.
     max_attempts = max(
         3,
-        len(MISTRAL_CLIENTS) * 2,
+        len(NVIDIA_CLIENTS) * 2,
     )
 
     last_exception: Optional[Exception] = None
@@ -326,7 +394,7 @@ def _mistral_complete(
         )
 
         total_keys = len(
-            MISTRAL_CLIENTS
+            NVIDIA_CLIENTS
         )
 
         kwargs: dict[str, Any] = {
@@ -335,16 +403,20 @@ def _mistral_complete(
             "temperature": temperature,
         }
 
-        if response_format is not None:
-            kwargs["response_format"] = (
-                response_format
-            )
-
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
 
+        # Nemotron 3.5 Lightning supports reasoning controls.
+        if ENABLE_THINKING:
+            kwargs["extra_body"] = {
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                },
+                "reasoning_budget": REASONING_BUDGET,
+            }
+
         try:
-            return client.chat.complete(
+            return client.chat.completions.create(
                 **kwargs
             )
 
@@ -361,18 +433,18 @@ def _mistral_complete(
                 raise
 
             # ------------------------------------------------
-            # 429
+            # 429 / throttling
             # ------------------------------------------------
 
             print(
-                "[Mistral] Rate limited "
+                "[NVIDIA] Rate limited "
                 f"on key {key_number}/"
                 f"{total_keys} "
                 f"(attempt {attempt + 1}/"
                 f"{max_attempts})."
             )
 
-            # Rotate immediately.
+            # Rotate immediately if several keys exist.
             _rotate_key()
 
             # ------------------------------------------------
@@ -389,8 +461,9 @@ def _mistral_complete(
                 )
 
                 print(
-                    "[Mistral] Retrying in "
-                    f"{delay:.2f}s with key "
+                    "[NVIDIA] Cooling down "
+                    f"for {delay:.2f}s; "
+                    "retrying with key "
                     f"{next_key_number}/"
                     f"{total_keys}."
                 )
@@ -400,9 +473,9 @@ def _mistral_complete(
                 )
 
     raise RuntimeError(
-        "Mistral API remained rate-limited after "
+        "NVIDIA API remained rate-limited after "
         f"{max_attempts} attempts across "
-        f"{len(MISTRAL_CLIENTS)} configured key(s)."
+        f"{len(NVIDIA_CLIENTS)} configured key(s)."
     ) from last_exception
 
 
@@ -540,8 +613,8 @@ def _clean_content(
     content: Any,
 ) -> str:
     """
-    Normalize different Mistral response-content shapes into
-    plain text suitable for json.loads().
+    Normalize different OpenAI-compatible response-content
+    shapes into plain text suitable for json.loads().
     """
 
     if isinstance(
@@ -574,6 +647,40 @@ def _clean_content(
         return ""
 
     return str(content)
+
+
+def _strip_code_fences(
+    text: str,
+) -> str:
+    """
+    Remove accidental markdown JSON fences even though the
+    system prompt explicitly tells the model not to use them.
+    """
+
+    text = text.strip()
+
+    if text.startswith(
+        "```json"
+    ):
+        text = text[
+            7:
+        ].strip()
+
+    elif text.startswith(
+        "```"
+    ):
+        text = text[
+            3:
+        ].strip()
+
+    if text.endswith(
+        "```"
+    ):
+        text = text[
+            :-3
+        ].strip()
+
+    return text
 
 
 def _clamp_score(
@@ -771,14 +878,16 @@ def generate_reply(
     """
     Generate the relationship-coaching response.
 
-    Mistral requests go through _mistral_complete(), which
+    NVIDIA requests go through _nvidia_complete(), which
     provides:
 
-      - multiple API keys
+      - NVIDIA OpenAI-compatible API
+      - optional multiple API keys
       - automatic key rotation
       - 429 handling
       - exponential retry/backoff
       - jitter
+      - optional Nemotron reasoning
     """
 
     boredom, reciprocity, fallback_vibe = (
@@ -795,7 +904,7 @@ def generate_reply(
         incoming,
     )
 
-    response = _mistral_complete(
+    response = _nvidia_complete(
         messages=[
             {
                 "role": "system",
@@ -806,10 +915,8 @@ def generate_reply(
                 "content": context,
             },
         ],
-        response_format={
-            "type": "json_object",
-        },
         temperature=0.55,
+        max_tokens=16384,
     )
 
     # ========================================================
@@ -830,7 +937,7 @@ def generate_reply(
         TypeError,
     ) as exc:
         raise RuntimeError(
-            "Mistral returned an unexpected response structure."
+            "NVIDIA returned an unexpected response structure."
         ) from exc
 
     cleaned = _clean_content(
@@ -839,8 +946,16 @@ def generate_reply(
 
     if not cleaned:
         raise RuntimeError(
-            "Mistral returned an empty response."
+            "NVIDIA returned an empty response."
         )
+
+    cleaned = _strip_code_fences(
+        cleaned
+    )
+
+    # ========================================================
+    # Parse JSON
+    # ========================================================
 
     try:
         data = json.loads(
@@ -848,10 +963,10 @@ def generate_reply(
         )
 
     except json.JSONDecodeError as exc:
-        preview = cleaned[:1000]
+        preview = cleaned[:1500]
 
         raise RuntimeError(
-            "Mistral returned invalid JSON. "
+            "NVIDIA returned invalid JSON. "
             f"Response preview: {preview}"
         ) from exc
 
@@ -860,7 +975,7 @@ def generate_reply(
         dict,
     ):
         raise RuntimeError(
-            "Mistral returned JSON that was not an object."
+            "NVIDIA returned JSON that was not an object."
         )
 
     # ========================================================
@@ -954,7 +1069,7 @@ def generate_reply(
             default=3,
         )
 
-        # Memory importance is 1-5, not 0-100.
+        # Memory importance is 1-5.
         importance = max(
             1,
             min(
