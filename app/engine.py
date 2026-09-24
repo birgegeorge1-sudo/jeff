@@ -13,12 +13,12 @@ from openai import OpenAI
 
 MODEL = os.getenv(
     "MODEL",
-    "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "agnes-2.5-flash",
 )
 
-NVIDIA_BASE_URL = os.getenv(
-    "NVIDIA_BASE_URL",
-    "https://integrate.api.nvidia.com/v1",
+AGNES_BASE_URL = os.getenv(
+    "AGNES_BASE_URL",
+    "https://apihub.agnes-ai.com/v1",
 )
 
 PERSONA_PATH = os.getenv(
@@ -85,12 +85,12 @@ except json.JSONDecodeError as exc:
 
 
 # ============================================================
-# NVIDIA API key pool
+# AGNES API key pool
 # ============================================================
 
-def _load_nvidia_keys() -> list[str]:
+def _load_agnes_keys() -> list[str]:
     raw_pool = os.getenv(
-        "NVIDIA_API_KEYS",
+        "AGNES_API_KEYS",
         "",
     ).strip()
 
@@ -99,7 +99,7 @@ def _load_nvidia_keys() -> list[str]:
     else:
         raw_values = [
             os.getenv(
-                "NVIDIA_API_KEY",
+                "AGNES_API_KEY",
                 "",
             )
         ]
@@ -120,48 +120,48 @@ def _load_nvidia_keys() -> list[str]:
     return keys
 
 
-NVIDIA_API_KEYS = _load_nvidia_keys()
+AGNES_API_KEYS = _load_agnes_keys()
 
-if not NVIDIA_API_KEYS:
+if not AGNES_API_KEYS:
     raise RuntimeError(
-        "No NVIDIA API key configured. "
-        "Set NVIDIA_API_KEY or NVIDIA_API_KEYS."
+        "No Agnes API key configured. "
+        "Set AGNES_API_KEY or AGNES_API_KEYS."
     )
 
 
-NVIDIA_CLIENTS = [
+AGNES_CLIENTS = [
     OpenAI(
         api_key=key,
-        base_url=NVIDIA_BASE_URL,
+        base_url=AGNES_BASE_URL,
         timeout=90.0,
         max_retries=0,
     )
-    for key in NVIDIA_API_KEYS
+    for key in AGNES_API_KEYS
 ]
 
 
 print(
-    "[NVIDIA] Loaded "
-    f"{len(NVIDIA_CLIENTS)} API key(s)."
+    "[AGNES] Loaded "
+    f"{len(AGNES_CLIENTS)} API key(s)."
 )
 
 print(
-    "[NVIDIA] Model: "
+    "[AGNES] Model: "
     f"{MODEL}"
 )
 
 print(
-    "[NVIDIA] Base URL: "
-    f"{NVIDIA_BASE_URL}"
+    "[AGNES] Base URL: "
+    f"{AGNES_BASE_URL}"
 )
 
 print(
-    "[NVIDIA] Thinking: "
+    "[AGNES] Thinking: "
     f"{ENABLE_THINKING}"
 )
 
 print(
-    "[NVIDIA] Reasoning budget: "
+    "[AGNES] Reasoning budget (local config): "
     f"{REASONING_BUDGET}"
 )
 
@@ -174,14 +174,14 @@ _current_key_index = 0
 
 
 def _current_client() -> OpenAI:
-    return NVIDIA_CLIENTS[
+    return AGNES_CLIENTS[
         _current_key_index
     ]
 
 
 def _rotate_key() -> None:
     """
-    Move to the next configured NVIDIA API key.
+    Move to the next configured Agnes API key.
 
     With one key this is a no-op.
     With multiple keys the position wraps around.
@@ -189,12 +189,12 @@ def _rotate_key() -> None:
 
     global _current_key_index
 
-    if len(NVIDIA_CLIENTS) <= 1:
+    if len(AGNES_CLIENTS) <= 1:
         return
 
     _current_key_index = (
         _current_key_index + 1
-    ) % len(NVIDIA_CLIENTS)
+    ) % len(AGNES_CLIENTS)
 
 
 # ============================================================
@@ -332,33 +332,33 @@ def _retry_delay(
 
 
 # ============================================================
-# Centralized NVIDIA completion handler
+# Centralized Agnes completion handler
 # ============================================================
 
-def _nvidia_complete(
+def _agnes_complete(
     *,
     messages: list[dict[str, Any]],
     temperature: float = 0.65,
     max_tokens: Optional[int] = None,
 ):
     """
-    Centralized NVIDIA request handler.
+    Centralized Agnes request handler.
 
     Features:
-      - NVIDIA OpenAI-compatible API
+      - Agnes OpenAI-compatible API
       - optional multiple API keys
       - automatic key rotation
       - HTTP 429 detection
       - exponential backoff
       - jitter
       - bounded retries
-      - optional Nemotron reasoning
+      - optional Agnes Thinking mode
       - bounded HTTP timeout
     """
 
     max_attempts = max(
         3,
-        len(NVIDIA_CLIENTS) * 2,
+        len(AGNES_CLIENTS) * 2,
     )
 
     last_exception: Optional[Exception] = None
@@ -373,7 +373,7 @@ def _nvidia_complete(
         )
 
         total_keys = len(
-            NVIDIA_CLIENTS
+            AGNES_CLIENTS
         )
 
         kwargs: dict[str, Any] = {
@@ -390,7 +390,6 @@ def _nvidia_complete(
                 "chat_template_kwargs": {
                     "enable_thinking": True,
                 },
-                "reasoning_budget": REASONING_BUDGET,
             }
 
         try:
@@ -407,7 +406,7 @@ def _nvidia_complete(
                 raise
 
             print(
-                "[NVIDIA] Rate limited "
+                "[AGNES] Rate limited "
                 f"on key {key_number}/"
                 f"{total_keys} "
                 f"(attempt {attempt + 1}/"
@@ -426,7 +425,7 @@ def _nvidia_complete(
                 )
 
                 print(
-                    "[NVIDIA] Cooling down "
+                    "[AGNES] Cooling down "
                     f"for {delay:.2f}s; "
                     "retrying with key "
                     f"{next_key_number}/"
@@ -438,9 +437,9 @@ def _nvidia_complete(
                 )
 
     raise RuntimeError(
-        "NVIDIA API remained rate-limited after "
+        "Agnes API remained rate-limited after "
         f"{max_attempts} attempts across "
-        f"{len(NVIDIA_CLIENTS)} configured key(s)."
+        f"{len(AGNES_CLIENTS)} configured key(s)."
     ) from last_exception
 
 
@@ -837,15 +836,15 @@ not because a message is supposed to contain an emoji.
 
 Good options include:
 
-😂
-😅
-🙂
-😊
-😉
-😏
-🙄
-❤️
-👍
+ðŸ˜‚
+ðŸ˜…
+ðŸ™‚
+ðŸ˜Š
+ðŸ˜‰
+ðŸ˜
+ðŸ™„
+â¤ï¸
+ðŸ‘
 
 Sometimes no emoji is best.
 
@@ -861,15 +860,15 @@ Do not put a smiley on every sentence.
 
 Do not write:
 
-"Hey 😊 how are you 😊"
+"Hey ðŸ˜Š how are you ðŸ˜Š"
 
 Prefer:
 
-"Okay, that's actually funny 😂"
+"Okay, that's actually funny ðŸ˜‚"
 
 or:
 
-"Good to hear from you 🙂"
+"Good to hear from you ðŸ™‚"
 
 or simply:
 
@@ -1440,9 +1439,9 @@ def deterministic_signals(
         for marker in (
             "haha",
             "lol",
-            "😂",
-            "😊",
-            "😄",
+            "ðŸ˜‚",
+            "ðŸ˜Š",
+            "ðŸ˜„",
         )
     ):
         reciprocity += 10
@@ -1613,7 +1612,7 @@ def generate_reply(
         incoming,
     )
 
-    response = _nvidia_complete(
+    response = _agnes_complete(
         messages=[
             {
                 "role": "system",
@@ -1646,7 +1645,7 @@ def generate_reply(
         TypeError,
     ) as exc:
         raise RuntimeError(
-            "NVIDIA returned an unexpected response structure."
+            "Agnes returned an unexpected response structure."
         ) from exc
 
     cleaned = _clean_content(
@@ -1655,7 +1654,7 @@ def generate_reply(
 
     if not cleaned:
         raise RuntimeError(
-            "NVIDIA returned an empty response."
+            "Agnes returned an empty response."
         )
 
     cleaned = _strip_code_fences(
@@ -1675,7 +1674,7 @@ def generate_reply(
         preview = cleaned[:1500]
 
         raise RuntimeError(
-            "NVIDIA returned invalid JSON. "
+            "Agnes returned invalid JSON. "
             f"Response preview: {preview}"
         ) from exc
 
@@ -1684,7 +1683,7 @@ def generate_reply(
         dict,
     ):
         raise RuntimeError(
-            "NVIDIA returned JSON that was not an object."
+            "Agnes returned JSON that was not an object."
         )
 
     # ========================================================
@@ -2166,7 +2165,7 @@ def generate_reply(
 
     if not data["reply"]:
         raise RuntimeError(
-            "NVIDIA returned valid JSON but no usable reply."
+            "Agnes returned valid JSON but no usable reply."
         )
 
     return data
