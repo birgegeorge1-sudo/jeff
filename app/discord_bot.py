@@ -1179,6 +1179,36 @@ def run():
             )
 
             _time.sleep(delay)
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+
+            is_session_transient = (
+                "session is closed" in msg
+                or "session is not open" in msg
+                or "closed" in msg
+            )
+
+            if not is_session_transient:
+                raise
+
+            print(
+                f"[DISCORD] Session transient "
+                f"(attempt {attempt}/{max_login_attempts}): {exc}"
+            )
+
+            if attempt >= max_login_attempts:
+                raise
+
+            delay = min(
+                max_delay,
+                base_delay * (2 ** (attempt - 1)),
+            )
+
+            print(
+                f"[DISCORD] Waiting {delay:.0f}s before retry."
+            )
+
+            _time.sleep(delay)
 
 
 if __name__ == "__main__":
