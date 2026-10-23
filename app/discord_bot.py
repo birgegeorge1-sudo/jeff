@@ -596,6 +596,32 @@ async def _render_analysis(
     """
     Render generated relationship analysis.
     """
+    def _field_value(raw: Any, default: str = "—") -> str:
+        """
+        Guarantee a non-empty, safe embed field value.
+
+        Discord rejects embeds where any field value is an empty string
+        (error 50035 'Invalid Form Body'). This helper coerces any
+        input to a non-empty string under 1024 chars.
+        """
+        s = str(raw).strip() if raw is not None else ""
+        if not s:
+            s = default
+        if len(s) > 1024:
+            s = s[:1021] + "…"
+        return s
+
+    def _desc_value(raw: Any, default: str = "No reply draft was generated.") -> str:
+        """
+        Same guard for the embed description (max 4096).
+        """
+        s = str(raw).strip() if raw is not None else ""
+        if not s:
+            s = default
+        if len(s) > 4096:
+            s = s[:4093] + "…"
+        return s
+
     reply_text = str(
         result.get(
             "reply",
@@ -604,33 +630,30 @@ async def _render_analysis(
         or ""
     )
 
-    if not reply_text:
-        reply_text = "No reply draft was generated."
-
     embed = discord.Embed(
-        title=f"💬 {contact_display_name}",
-        description=reply_text[:4096],
+        title=f"🤔 {contact_display_name}",
+        description=_desc_value(reply_text),
     )
 
     embed.add_field(
         name="Stage",
-        value=str(
+        value=_field_value(
             result.get(
                 "relationship_stage",
                 "unknown",
             )
-        )[:1024],
+        ),
         inline=True,
     )
 
     embed.add_field(
         name="Vibe",
-        value=str(
+        value=_field_value(
             result.get(
                 "vibe",
                 "unknown",
             )
-        )[:1024],
+        ),
         inline=True,
     )
 
@@ -648,23 +671,23 @@ async def _render_analysis(
 
     embed.add_field(
         name="Send mode",
-        value=str(
+        value=_field_value(
             result.get(
                 "send_mode",
                 "text",
             )
-        )[:1024],
+        ),
         inline=True,
     )
 
     embed.add_field(
         name="Next move",
-        value=str(
+        value=_field_value(
             result.get(
                 "next_goal",
                 "Keep the interaction natural.",
             )
-        )[:1024],
+        ),
         inline=False,
     )
 
@@ -677,13 +700,14 @@ async def _render_analysis(
         alternative_text = "\n\n".join(
             str(item)
             for item in alternatives[:2]
-        )
+        ).strip()
 
-        embed.add_field(
-            name="Alternative drafts",
-            value=alternative_text[:1900],
-            inline=False,
-        )
+        if alternative_text:
+            embed.add_field(
+                name="Alternative drafts",
+                value=alternative_text[:1900] or "—",
+                inline=False,
+            )
 
     voice_script = result.get(
         "voice_script",
@@ -691,11 +715,13 @@ async def _render_analysis(
     )
 
     if voice_script:
-        embed.add_field(
-            name="🎙️ Voice-note draft",
-            value=str(voice_script)[:1000],
-            inline=False,
-        )
+        vs = str(voice_script).strip()
+        if vs:
+            embed.add_field(
+                name="📝 Voice-note draft",
+                value=vs[:1000],
+                inline=False,
+            )
 
     intimacy_guidance = result.get(
         "intimacy_guidance",
@@ -703,11 +729,13 @@ async def _render_analysis(
     )
 
     if intimacy_guidance:
-        embed.add_field(
-            name="❤️ Intimacy guidance",
-            value=str(intimacy_guidance)[:1000],
-            inline=False,
-        )
+        ig = str(intimacy_guidance).strip()
+        if ig:
+            embed.add_field(
+                name="💬 Intimacy guidance",
+                value=ig[:1000],
+                inline=False,
+            )
 
     await source.reply(
         embed=embed,
@@ -1060,8 +1088,15 @@ async def _handle_command_error(
     if isinstance(error, commands.CommandNotFound):
         return
 
+    # Truncate the error string so the reply never exceeds
+    # Discord's 2000-character limit (prevents 50035 'Invalid Form Body').
+    _err_msg = str(error)
+
+    if len(_err_msg) > 500:
+        _err_msg = _err_msg[:497] + "…"
+
     await ctx.reply(
-        f"❌ Command error: {error}"
+        f"❌ Command error: {_err_msg}"
     )
 
     print(
@@ -1077,14 +1112,73 @@ bot.add_listener(
 
 
 def run():
+    import time as _time
+
     if not DISCORD_BOT_TOKEN:
         raise RuntimeError(
             "DISCORD_BOT_TOKEN is missing"
         )
 
-    bot.run(
-        DISCORD_BOT_TOKEN
-    )
+    # Backed-off login loop.
+    #
+    # When the container's IP is rate-limited (HTTP 429 / Cloudflare
+    # 1015), a crash makes Render restart the bot immediately, which
+    # re-triggers the ban. Instead, wait with exponential backoff and
+    # retry a bounded number of times.
+    max_login_attempts = 6
+    base_delay = 15.0
+    max_delay = 300.0
+
+    attempt = 0
+
+    while True:
+        attempt += 1
+
+        try:
+            bot.run(
+                DISCORD_BOT_TOKEN,
+                reconnect=True,
+            )
+
+            break
+
+        except discord.LoginFailure as exc:
+            print(
+                f"[DISCORD] Login failed "
+                f"(attempt {attempt}/{max_login_attempts}): {exc}"
+            )
+
+            if attempt >= max_login_attempts:
+                raise
+
+            delay = min(
+                max_delay,
+                base_delay * (2 ** (attempt - 1)),
+            )
+
+            print(
+                f"[DISCORD] Waiting {delay:.0f}s before re-login."
+            )
+
+            _time.sleep(delay)
+
+        except discord.HTTPException as exc:
+            code = getattr(exc, "code", None)
+
+            print(
+                f"[DISCORD] HTTP {code} during start; "
+                f"retrying with backoff."
+            )
+
+            if attempt >= max_login_attempts:
+                raise
+
+            delay = min(
+                max_delay,
+                base_delay * (2 ** (attempt - 1)),
+            )
+
+            _time.sleep(delay)
 
 
 if __name__ == "__main__":
