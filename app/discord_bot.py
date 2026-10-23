@@ -1077,14 +1077,73 @@ bot.add_listener(
 
 
 def run():
+    import time as _time
+
     if not DISCORD_BOT_TOKEN:
         raise RuntimeError(
             "DISCORD_BOT_TOKEN is missing"
         )
 
-    bot.run(
-        DISCORD_BOT_TOKEN
-    )
+    # Backed-off login loop.
+    #
+    # When the container's IP is rate-limited (HTTP 429 / Cloudflare
+    # 1015), a crash makes Render restart the bot immediately, which
+    # re-triggers the ban. Instead, wait with exponential backoff and
+    # retry a bounded number of times.
+    max_login_attempts = 6
+    base_delay = 15.0
+    max_delay = 300.0
+
+    attempt = 0
+
+    while True:
+        attempt += 1
+
+        try:
+            bot.run(
+                DISCORD_BOT_TOKEN,
+                reconnect=True,
+            )
+
+            break
+
+        except discord.LoginFailure as exc:
+            print(
+                f"[DISCORD] Login failed "
+                f"(attempt {attempt}/{max_login_attempts}): {exc}"
+            )
+
+            if attempt >= max_login_attempts:
+                raise
+
+            delay = min(
+                max_delay,
+                base_delay * (2 ** (attempt - 1)),
+            )
+
+            print(
+                f"[DISCORD] Waiting {delay:.0f}s before re-login."
+            )
+
+            _time.sleep(delay)
+
+        except discord.HTTPException as exc:
+            code = getattr(exc, "code", None)
+
+            print(
+                f"[DISCORD] HTTP {code} during start; "
+                f"retrying with backoff."
+            )
+
+            if attempt >= max_login_attempts:
+                raise
+
+            delay = min(
+                max_delay,
+                base_delay * (2 ** (attempt - 1)),
+            )
+
+            _time.sleep(delay)
 
 
 if __name__ == "__main__":
