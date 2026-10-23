@@ -1088,8 +1088,15 @@ async def _handle_command_error(
     if isinstance(error, commands.CommandNotFound):
         return
 
+    # Truncate the error string so the reply never exceeds
+    # Discord's 2000-character limit (prevents 50035 'Invalid Form Body').
+    _err_msg = str(error)
+
+    if len(_err_msg) > 500:
+        _err_msg = _err_msg[:497] + "…"
+
     await ctx.reply(
-        f"❌ Command error: {error}"
+        f"❌ Command error: {_err_msg}"
     )
 
     print(
